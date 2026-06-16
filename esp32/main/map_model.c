@@ -69,8 +69,13 @@ static void map_swap_to_front(void)
     map_unlock();
 }
 
+/* view_span_dm mặc định (200 m) khi phone chưa gửi (frame cũ < 14 byte hoặc
+ * MapView chưa layout xong) — tránh chia 0 / scale rác trong projection. */
+#define MAP_DEFAULT_VIEW_SPAN_DM 2000
+
 /* ── 0x30 MAP_POSE ────────────────────────────────────────────────────
- * lat i32 | lng i32 | heading u16 | speed u8 | flags u8 → 12 byte. */
+ * lat i32 | lng i32 | heading u16 | speed u8 | flags u8 | view_span_dm u16
+ * → 14 byte (chấp nhận frame cũ 12 byte, dùng span mặc định). */
 static void map_on_pose(uint8_t type, const uint8_t *p, uint16_t len, void *ctx)
 {
     (void)type;
@@ -86,6 +91,10 @@ static void map_on_pose(uint8_t type, const uint8_t *p, uint16_t len, void *ctx)
     pose.heading_ddeg = le_u16(&p[8]);
     pose.speed_kmh    = p[10];
     pose.flags        = p[11];
+    pose.view_span_dm = (len >= 14) ? le_u16(&p[12]) : MAP_DEFAULT_VIEW_SPAN_DM;
+    if (pose.view_span_dm == 0) {
+        pose.view_span_dm = MAP_DEFAULT_VIEW_SPAN_DM;
+    }
 
     map_lock();
     s_pose     = pose;

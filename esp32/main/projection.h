@@ -24,10 +24,10 @@ typedef struct {
     int32_t user_e_dm;   /* offset user so với anchor (dm, north-up) */
     int32_t user_n_dm;
     float   sin_h, cos_h; /* xoay -heading */
-    float   px_per_dm;    /* zoom (auto theo speed) */
+    float   px_per_dm;    /* zoom, khớp pose->view_span_dm (tỷ lệ điện thoại) */
 } proj_ctx_t;
 
-/* Tính ctx từ geom (anchor) + pose (live). zoom auto theo pose->speed_kmh. */
+/* Tính ctx từ geom (anchor) + pose (live). zoom khớp pose->view_span_dm. */
 void projection_begin(proj_ctx_t *c, const map_geom_t *g, const map_pose_t *pose);
 
 /* Chiếu 1 điểm north-up dm (so với anchor) ra pixel. */

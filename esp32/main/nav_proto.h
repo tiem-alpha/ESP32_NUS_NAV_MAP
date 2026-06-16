@@ -73,6 +73,8 @@ typedef struct {
     uint16_t heading_ddeg; /* 0.1°, 0..3599 */
     uint8_t  speed_kmh;
     uint8_t  flags;
+    uint16_t view_span_dm; /* mét×10 toàn chiều rộng màn điện thoại ở zoom
+                             * hiện tại — projection dùng để khớp tỷ lệ zoom. */
 } map_pose_t;
 
 /* ── Helper đọc little-endian (parser dùng chung) ────────────────────── */

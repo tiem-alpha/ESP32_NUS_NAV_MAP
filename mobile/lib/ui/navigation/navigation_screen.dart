@@ -50,6 +50,9 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   GeoPoint? _lastMapDataCenter;
   static const _mapDataResendThresholdM = 800.0;
 
+  // Fallback view_span_dm trước khi MapView layout xong (xem viewSpanMAt).
+  static const _defaultViewSpanM = 200.0;
+
   @override
   void initState() {
     super.initState();
@@ -130,11 +133,14 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
         final lastPos = _lastMapPosSent;
         if (lastPos == null || lastPos.distanceTo(pos) >= _mapPosMoveThresholdM) {
           _lastMapPosSent = pos;
+          final viewSpanM =
+              _mapKey.currentState?.viewSpanMAt(pos.lat) ?? _defaultViewSpanM;
           ref.read(bleBridgeProvider).sendMapPosition(
             lat: pos.lat,
             lng: pos.lng,
             bearing: next.bearing,
             speedKmh: next.speedKmh.round(),
+            viewSpanM: viewSpanM,
           );
           final lastCenter = _lastMapDataCenter;
           if (lastCenter == null ||

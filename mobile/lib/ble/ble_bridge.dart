@@ -36,7 +36,11 @@
 //   0x30 MAP_POSE  App→Dev  lat i32(deg×1e7), lng i32(deg×1e7),
 //                           heading u16(0.1°, 0..3599), speed u8(km/h),
 //                           flags u8 (bit0 gps_fix, bit1 off_route,
-//                           bit2 navigating)                          [12B]
+//                           bit2 navigating), view_span_dm u16 (mét quy
+//                           đổi sang dm mà TOÀN CHIỀU RỘNG màn hình điện
+//                           thoại đang hiển thị ở zoom dẫn đường hiện tại —
+//                           ESP32 suy ra px_per_dm = SCR_W/view_span_dm để
+//                           khớp đúng tỷ lệ zoom điện thoại)           [14B]
 //   0x31 MAP_ROUTE App→Dev  header: anchor_lat i32, anchor_lng i32, seq u8,
 //                           frag_idx u8, frag_total u8, n u16; rồi n×{east
 //                           i16, north i16} (dm so với anchor, north-up).
@@ -258,11 +262,17 @@ class BleBridge {
 
   /// MAP_POSE (0x30) — vị trí + heading + cờ, gói thường xuyên (coalesced).
   /// Cũng nhớ pose làm nguồn anchor cho lần sendMapData kế tiếp.
+  ///
+  /// [viewSpanM]: mét hiển thị trên TOÀN CHIỀU RỘNG màn hình điện thoại ở
+  /// zoom dẫn đường hiện tại (vd ~200 m) — ESP32 dùng để đặt scale của nó
+  /// sao cho toàn màn hình HUD cũng hiển thị đúng số mét đó, tương đương
+  /// tỷ lệ zoom trên điện thoại.
   void sendMapPosition({
     required double lat,
     required double lng,
     required double bearing,
     required int speedKmh,
+    required double viewSpanM,
   }) {
     _lastPose = GeoPoint(lat, lng);
     final b = BytesBuilder();
@@ -273,6 +283,7 @@ class BleBridge {
     _putU16(b, (headingDeci + 3600) % 3600);
     b.addByte(speedKmh.clamp(0, 255)); // speed u8 (km/h)
     b.addByte(_poseFlags()); // flags u8
+    _putU16(b, (viewSpanM * 10).round().clamp(1, 65535)); // view_span_dm
     _enqueue(_typeMapPose, b.toBytes(), coalesce: true);
   }
 

@@ -315,13 +315,15 @@ NUS chỉ là "ống UART" — cần định nghĩa framing + message. Thiết k
 
 **Mô hình hiển thị (chốt):** ESP32 vẽ **bản đồ chiếm toàn bộ 240×320**, thông tin dẫn đường (mũi tên rẽ + khoảng cách, tốc độ, ETA, biển báo, trạng thái BLE/GPS) là **overlay bán trong suốt** vẽ ĐÈ lên map (dữ liệu overlay lấy từ §6.2/§6.3: NAV_INSTRUCTION/DISTANCE_TICK/SPEED_LIMIT/NAV_STATE — không lặp lại trong nhóm map).
 
-**Ai chiếu toạ độ:** **ESP32 tự chiếu** (app không biết kích thước màn HUD). App chỉ gửi hình học ở hệ **mét địa lý north-up** quanh một điểm *anchor* tuyệt đối; ESP32 mỗi khung tự: (1) dịch theo `live_pose − anchor`, (2) **xoay −heading** (heading-up), (3) scale theo zoom (auto theo speed), (4) đặt user ở **giữa-dưới** màn. Vì offset là north-up nên **đổi heading KHÔNG cần gửi lại** route/roads — chỉ MAP_POSE đổi.
+**Ai chiếu toạ độ:** **ESP32 tự chiếu** (app không biết kích thước màn HUD). App chỉ gửi hình học ở hệ **mét địa lý north-up** quanh một điểm *anchor* tuyệt đối; ESP32 mỗi khung tự: (1) dịch theo `live_pose − anchor`, (2) **xoay −heading** (heading-up), (3) scale theo `view_span_dm` (xem dưới), (4) đặt user ở **giữa-dưới** màn. Vì offset là north-up nên **đổi heading KHÔNG cần gửi lại** route/roads — chỉ MAP_POSE đổi.
+
+**Khớp tỷ lệ zoom với điện thoại:** App tính `view_span_dm` = số mét (×10) mà TOÀN CHIỀU RỘNG màn hình điện thoại đang hiển thị ở zoom dẫn đường hiện tại (`widget width × metersPerPixel(lat, zoom)`), gửi kèm trong mỗi MAP_POSE. ESP32 suy ra `px_per_dm = SCR_W / view_span_dm` — nhờ vậy toàn màn hình HUD cũng hiển thị đúng số mét đó (vd điện thoại full màn hình = 200 m thì HUD full màn hình cũng ≈ 200 m), không còn zoom tự chọn theo tốc độ độc lập với điện thoại.
 
 **Tiết kiệm băng thông (yêu cầu cứng):** chỉ `MAP_POSE` gửi thường xuyên (~3–5 m hoặc ~2 Hz, ~16 byte/gói, Write-No-Response, coalesce). `MAP_ROUTE`/`MAP_ROADS` gửi **hiếm**: khi bắt đầu/reroute, hoặc khi user rời anchor > ~800 m. Trước khi gửi: simplify (Douglas–Peucker) + **clip cửa sổ ~1.2 km** quanh user (chỉ phần HUD nhìn thấy).
 
 | TYPE | Tên | Chiều | Tần suất | Payload (little-endian) |
 |---|---|---|---|---|
-| 0x30 | MAP_POSE | App→Dev | thường xuyên (~2 Hz) | `lat` i32 (deg×1e7), `lng` i32 (deg×1e7), `heading` u16 (0.1°, 0..3599), `speed` u8 (km/h), `flags` u8 (bit0 gps_fix, bit1 off_route, bit2 navigating) — **12 byte** |
+| 0x30 | MAP_POSE | App→Dev | thường xuyên (~2 Hz) | `lat` i32 (deg×1e7), `lng` i32 (deg×1e7), `heading` u16 (0.1°, 0..3599), `speed` u8 (km/h), `flags` u8 (bit0 gps_fix, bit1 off_route, bit2 navigating), `view_span_dm` u16 (mét×10 toàn chiều rộng màn hình điện thoại ở zoom hiện tại — ESP32 dùng để khớp tỷ lệ zoom) — **14 byte** |
 | 0x31 | MAP_ROUTE | App→Dev | hiếm | **header**: `anchor_lat` i32, `anchor_lng` i32, `seq` u8, `frag_idx` u8, `frag_total` u8, `n` u16; **rồi** `n`×{`east` i16, `north` i16} (decimet so với anchor, north-up). Fragment nhiều frame cùng `seq` khi LEN>200 |
 | 0x32 | MAP_ROADS | App→Dev | hiếm | **header**: `anchor_lat` i32, `anchor_lng` i32, `seq` u8, `road_count` u8; **rồi** mỗi road: `class` u8 (`HighwayType.value`), `pt_count` u8, `pt_count`×{`east` i16, `north` i16} (dm). Ưu tiên road **gần tuyến đường chính nhất** (khả năng giao cắt cao) trước, đồng hạng thì `class` nhỏ (đường lớn) trước; cắt về `MAP_MAX_ROADS` (firmware) khi vượt budget; fragment theo `seq` nếu cần |
 | 0x33 | MAP_CLOCK | App→Dev | mỗi 30 s + khi reconnect | `epoch_s` u32 (Unix time, UTC), `tz_offset_min` i16 (lệch giờ địa phương, phút) — ESP32 tick nội bộ giữa các lần sync bằng tick LVGL có sẵn |

@@ -762,6 +762,15 @@ class MapViewState extends ConsumerState<MapView>
     return 156543.03392 * math.cos(lat * math.pi / 180) / math.pow(2, zoom);
   }
 
+  /// Mét hiển thị trên toàn chiều rộng widget bản đồ ở zoom dẫn đường hiện
+  /// tại — dùng để báo ESP32 đặt scale HUD khớp đúng tỷ lệ zoom điện thoại
+  /// (MAP_POSE.view_span_dm, §6.2.1). Null nếu widget chưa layout xong.
+  double? viewSpanMAt(double lat) {
+    final width = context.size?.width;
+    if (width == null || width <= 0) return null;
+    return width * _metersPerPixel(lat, _navigationZoom);
+  }
+
   GeoPoint _offsetPoint(GeoPoint point, double bearingDeg, double distanceM) {
     const earthRadiusM = 6371000.0;
     final angularDistance = distanceM / earthRadiusM;

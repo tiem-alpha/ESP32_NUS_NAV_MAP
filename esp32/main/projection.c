@@ -16,29 +16,26 @@
 #define M_PER_DEG_LAT   111320.0   /* mét cho 1 độ vĩ */
 
 /*
- * Lựa chọn zoom (px_per_dm) theo tốc độ:
+ * Zoom (px_per_dm) khớp đúng tỷ lệ zoom điện thoại:
  *   - 1 dm = 0.1 m, nên px_per_dm = px_per_m / 10.
- *   - Đứng yên / chậm → zoom gần (chi tiết); đi nhanh → zoom xa (nhìn trước nhiều).
- *   - Map từ user (USER_Y≈230) tới mép trên (y=0) ≈ 230 px phía trước.
- *
- * Chọn dải mét-nhìn-trước ahead_m tuyến tính theo speed rồi suy ra px_per_dm:
- *   ahead_m: 60 m (đứng yên) → 250 m (≥90 km/h)
- *   px_per_dm = 230 / (ahead_m * 10)   (vì 230 px phủ ahead_m mét = ahead_m*10 dm)
- * Cho ra px_per_dm ≈ 0.383 (chậm) … 0.092 (nhanh). Kẹp về dải an toàn
- * 0.06 .. 0.16 px/dm theo yêu cầu để giữ ổn định thị giác.
+ *   - pose->view_span_dm = số mét×10 mà TOÀN CHIỀU RỘNG màn hình điện thoại
+ *     đang hiển thị (App tính từ widget width × metersPerPixel ở zoom dẫn
+ *     đường) → px_per_dm = SCR_W / view_span_dm cho HUD hiển thị đúng cùng
+ *     số mét đó trên toàn chiều rộng của nó.
+ *   - Kẹp về dải an toàn để tránh scale rác khi view_span_dm bất thường.
  */
-#define ZOOM_PX_PER_DM_MIN   0.06f   /* zoom xa nhất (đi nhanh) */
-#define ZOOM_PX_PER_DM_MAX   0.16f   /* zoom gần nhất (đứng yên) */
-#define ZOOM_SPEED_FULL_KMH  90.0f   /* tốc độ đạt zoom xa nhất */
+#define ZOOM_PX_PER_DM_MIN   0.02f   /* view_span rất lớn (zoom xa) */
+#define ZOOM_PX_PER_DM_MAX   0.40f   /* view_span rất nhỏ (zoom gần) */
 
-static inline float zoom_from_speed(uint8_t speed_kmh)
+static inline float px_per_dm_from_span(uint16_t view_span_dm)
 {
-    /* t: 0 (đứng yên) → 1 (≥ ZOOM_SPEED_FULL_KMH). */
-    float t = (float)speed_kmh / ZOOM_SPEED_FULL_KMH;
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    /* Nội suy MAX (chậm) → MIN (nhanh). */
-    return ZOOM_PX_PER_DM_MAX + t * (ZOOM_PX_PER_DM_MIN - ZOOM_PX_PER_DM_MAX);
+    if (view_span_dm == 0) {
+        view_span_dm = 1; /* tránh chia 0; map_model đã default trước đó */
+    }
+    float px_per_dm = (float)SCR_W / (float)view_span_dm;
+    if (px_per_dm < ZOOM_PX_PER_DM_MIN) px_per_dm = ZOOM_PX_PER_DM_MIN;
+    if (px_per_dm > ZOOM_PX_PER_DM_MAX) px_per_dm = ZOOM_PX_PER_DM_MAX;
+    return px_per_dm;
 }
 
 void projection_begin(proj_ctx_t *c, const map_geom_t *g, const map_pose_t *pose)
@@ -65,8 +62,8 @@ void projection_begin(proj_ctx_t *c, const map_geom_t *g, const map_pose_t *pose
     c->sin_h = sinf(heading_rad);
     c->cos_h = cosf(heading_rad);
 
-    /* Zoom auto theo tốc độ. */
-    c->px_per_dm = zoom_from_speed(pose->speed_kmh);
+    /* Zoom khớp tỷ lệ điện thoại theo view_span_dm. */
+    c->px_per_dm = px_per_dm_from_span(pose->view_span_dm);
 }
 
 scr_pt_t projection_point(const proj_ctx_t *c, int16_t e_dm, int16_t n_dm)
