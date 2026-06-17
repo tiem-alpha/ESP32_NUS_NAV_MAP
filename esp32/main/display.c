@@ -51,7 +51,7 @@ LV_FONT_DECLARE(lv_font_vi_12);
 /* ── Cấu hình panel / draw buffer ────────────────────────────────────── */
 #define LCD_H_RES        SCR_W   /* 240 */
 #define LCD_V_RES        SCR_H   /* 320 */
-#define LCD_DRAW_LINES   40      /* chiều cao 1 dải draw buffer (240×40) */
+#define LCD_DRAW_LINES   20      /* chiều cao 1 dải draw buffer (240×20) */
 #define LCD_CMD_BITS     8
 #define LCD_PARAM_BITS   8
 #define LVGL_TICK_MS     2
@@ -92,6 +92,7 @@ static lv_obj_t *s_clock_label  = NULL;  /* đồng hồ thực "07:42" */
 
 static bool s_connected     = false;  /* lưu state nếu UI chưa dựng */
 static bool s_ui_ready      = false;
+static map_geom_t s_render_geom;     /* BSS tĩnh: tránh giữ map mutex suốt 15ms vẽ */
 
 /* ── Mutex helpers ───────────────────────────────────────────────────── */
 static inline bool lvgl_lock(uint32_t timeout_ms)
@@ -215,13 +216,18 @@ static void map_draw_event_cb(lv_event_t *e)
     map_pose_t pose;
     map_model_get_pose(&pose);
 
-    const map_geom_t *g = map_model_lock_geom();
-    if (!g) {
-        return;  /* chưa có geom */
+    /* Lock chỉ để copy geom (~8 KB, ~0.1 ms), thả ngay trước khi render.
+     * BLE task (map_swap_to_front ~8 KB copy) chỉ bị block tối đa 0.1 ms
+     * thay vì 10–15 ms nếu để mutex suốt lúc vẽ — tránh watchdog reset. */
+    {
+        const map_geom_t *g = map_model_lock_geom();
+        if (!g) return;
+        s_render_geom = *g;       /* copy dưới mutex */
+        map_model_unlock_geom();  /* thả mutex TRƯỚC khi render */
     }
 
     proj_ctx_t proj;
-    projection_begin(&proj, g, &pose);
+    projection_begin(&proj, &s_render_geom, &pose);
 
     /* 1) Roads (xám, độ dày theo class). */
     lv_draw_line_dsc_t road_dsc;
@@ -229,8 +235,8 @@ static void map_draw_event_cb(lv_event_t *e)
     road_dsc.color = COL_ROAD;
     road_dsc.round_start = 1;
     road_dsc.round_end = 1;
-    for (int r = 0; r < g->road_n; r++) {
-        const map_road_t *road = &g->roads[r];
+    for (int r = 0; r < s_render_geom.road_n; r++) {
+        const map_road_t *road = &s_render_geom.roads[r];
         road_dsc.width = road_width_for_class(road->road_class);
         draw_polyline(draw_ctx, &road_dsc, road->pts, road->n, &proj);
     }
@@ -242,9 +248,7 @@ static void map_draw_event_cb(lv_event_t *e)
     route_dsc.width = 6;
     route_dsc.round_start = 1;
     route_dsc.round_end = 1;
-    draw_polyline(draw_ctx, &route_dsc, g->route, g->route_n, &proj);
-
-    map_model_unlock_geom();
+    draw_polyline(draw_ctx, &route_dsc, s_render_geom.route, s_render_geom.route_n, &proj);
 
     /* 3) Mũi tên user trên cùng. */
     draw_user_arrow(draw_ctx);

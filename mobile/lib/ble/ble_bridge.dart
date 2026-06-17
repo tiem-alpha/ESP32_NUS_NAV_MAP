@@ -100,6 +100,10 @@ const int _kMapMaxRoads = 48; // khớp MAP_MAX_ROADS firmware (48 = đủ hẻm
 // nhiều hơn chỉ lãng phí băng thông vì firmware sẽ bỏ phần thừa.
 const int _kMapMaxRoadPts = 40;
 
+// Payload tối đa mỗi MAP_ROADS frame — nhỏ hơn _kMaxPayload (200) để tránh
+// "ACL packet too short" / HCI error trên Bluedroid khi packet quá lớn.
+const int _kMapRoadsMaxPayload = 150;
+
 // Epsilon Douglas–Peucker (mét) — đơn giản hoá hình học route.
 const double _kSimplifyEpsM = 2.5;
 
@@ -696,7 +700,7 @@ class BleBridge {
         : encoded;
 
     const headerLen = 4 + 4 + 1 + 1; // 10 byte
-    final maxBody = _kMaxPayload - headerLen;
+    final maxBody = _kMapRoadsMaxPayload - headerLen; // 140B — tránh HCI error
 
     // Gom road vào frame; mỗi road = 2 + pts*4 byte. Road không vừa 1 frame
     // (hiếm) thì cắt bớt điểm.
