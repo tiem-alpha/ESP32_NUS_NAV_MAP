@@ -9,6 +9,7 @@ import '../../core/constants.dart';
 import '../../core/theme/app_theme.dart';
 import '../../models/app_settings.dart';
 import '../../models/geo_point.dart';
+import '../../models/road_segment.dart';
 import '../../models/route_model.dart';
 import '../../providers/ui_providers.dart';
 
@@ -336,12 +337,13 @@ class MapViewState extends ConsumerState<MapView>
     widget.onCameraBearingChanged?.call(b);
   }
 
-  /// Query road geometry around [userLat]/[userLng] for the mini-map.
+  /// Query road geometry from loaded vector tiles as [RoadSegment] list.
   ///
-  /// Uses querySourceFeatures on the vector tile source (camera-angle independent,
-  /// so roads behind/beside the user are included). Falls back to
-  /// queryRenderedFeaturesInRect if the source ID is unknown.
-  Future<List<List<GeoPoint>>> queryRoadsForMiniMap(
+  /// No external API call — uses tiles already loaded by MapLibre, so this is
+  /// fast and works offline. Covers ~450 m around user (camera viewport).
+  /// Uses querySourceFeatures (camera-angle independent) with fallback to
+  /// queryRenderedFeaturesInRect.
+  Future<List<RoadSegment>> queryRoadsForMiniMap(
     double userLat,
     double userLng,
   ) async {
@@ -361,9 +363,10 @@ class MapViewState extends ConsumerState<MapView>
     bool anyInBounds(List<GeoPoint> pts) =>
         pts.any((p) => p.lat >= bS && p.lat <= bN && p.lng >= bW && p.lng <= bE);
 
-    // Classes to skip on mini-map (too detailed / irrelevant for HUD).
+    // Classes to skip (non-vehicle ways). 'service' được giữ lại vì ở VN
+    // hẻm/ngõ nhỏ thường được gán highway=service trong OSM.
     const skipClasses = {
-      'service', 'track', 'path', 'footway', 'cycleway', 'steps',
+      'track', 'path', 'footway', 'cycleway', 'steps',
     };
 
     List<dynamic> raw = const [];
@@ -399,7 +402,7 @@ class MapViewState extends ConsumerState<MapView>
     }
 
     final seen = <String>{};
-    final roads = <List<GeoPoint>>[];
+    final roads = <RoadSegment>[];
 
     for (final feat in raw) {
       if (roads.length >= 80) break;
@@ -408,10 +411,11 @@ class MapViewState extends ConsumerState<MapView>
       final type = geom['type'] as String?;
       if (type != 'LineString' && type != 'MultiLineString') continue;
 
-      // Skip low-importance road classes if the property is available.
       final props = feat['properties'] as Map?;
       final cls = props?['class'] as String?;
       if (cls != null && skipClasses.contains(cls)) continue;
+
+      final hwType = HighwayType.fromOsmTag(cls ?? 'residential');
 
       void addLine(List<dynamic> coords) {
         if (coords.length < 2) return;
@@ -428,7 +432,7 @@ class MapViewState extends ConsumerState<MapView>
         final key =
             '${pts.first.lat.toStringAsFixed(5)},${pts.first.lng.toStringAsFixed(5)},'
             '${pts.last.lat.toStringAsFixed(5)},${pts.last.lng.toStringAsFixed(5)}';
-        if (seen.add(key)) roads.add(pts);
+        if (seen.add(key)) roads.add(RoadSegment(type: hwType, points: pts));
       }
 
       if (type == 'LineString') {

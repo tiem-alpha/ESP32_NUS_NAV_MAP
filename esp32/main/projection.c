@@ -11,6 +11,8 @@
 #include <math.h>
 #include <stdint.h>
 
+#include "esp_timer.h"
+
 /* Hằng số chuyển độ → mét (xấp xỉ Trái Đất cầu). */
 #define DEG_E7_TO_RAD   (1e-7 * (M_PI / 180.0))
 #define M_PER_DEG_LAT   111320.0   /* mét cho 1 độ vĩ */
@@ -61,6 +63,18 @@ void projection_begin(proj_ctx_t *c, const map_geom_t *g, const map_pose_t *pose
     float heading_rad = (float)pose->heading_ddeg * 0.1f * ((float)M_PI / 180.0f);
     c->sin_h = sinf(heading_rad);
     c->cos_h = cosf(heading_rad);
+
+    /* Dead reckoning: ngoại suy vị trí user giữa 2 MAP_POSE (~1 Hz GPS).
+     * dist_dm = speed(km/h) × (10/3.6) × elapsed(s)  [1 dm = 0.1 m]
+     * Hướng đông: sin(heading); hướng bắc: cos(heading) (north-up). */
+    if (pose->received_us > 0 && pose->speed_kmh > 3) {
+        float elapsed = (float)((esp_timer_get_time() - pose->received_us) * 1e-6);
+        if (elapsed > 0.0f && elapsed < 2.5f) {
+            float dist_dm = (float)pose->speed_kmh * (10.0f / 3.6f) * elapsed;
+            c->user_e_dm += (int32_t)roundf(dist_dm * c->sin_h);
+            c->user_n_dm += (int32_t)roundf(dist_dm * c->cos_h);
+        }
+    }
 
     /* Zoom khớp tỷ lệ điện thoại theo view_span_dm. */
     c->px_per_dm = px_per_dm_from_span(pose->view_span_dm);

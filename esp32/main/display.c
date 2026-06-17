@@ -593,7 +593,7 @@ void display_init(void)
     }
 
     /* 5) Task render LVGL. */
-    xTaskCreate(lvgl_task, "lvgl_task", 6 * 1024, NULL, 2, NULL);
+    xTaskCreate(lvgl_task, "lvgl_task", 8 * 1024, NULL, 2, NULL);
 
     ESP_LOGI(DISP_TAG, "Display + LVGL ready (partial buf %dx%d x2)",
              LCD_H_RES, LCD_DRAW_LINES);

@@ -94,7 +94,11 @@ const double _kRouteLeadInM = 50.0;
 
 // Khớp MAP_MAX_ROADS phía firmware (map_model.h) — road vượt ngưỡng này bị
 // firmware âm thầm bỏ theo thứ tự đến, nên phải tự cắt + ưu tiên ở mobile.
-const int _kMapMaxRoads = 32;
+const int _kMapMaxRoads = 48; // khớp MAP_MAX_ROADS firmware (48 = đủ hẻm VN, ổn định)
+
+// Số điểm tối đa mỗi road gửi xuống — khớp MAP_MAX_ROAD_PTS firmware. Gửi
+// nhiều hơn chỉ lãng phí băng thông vì firmware sẽ bỏ phần thừa.
+const int _kMapMaxRoadPts = 40;
 
 // Epsilon Douglas–Peucker (mét) — đơn giản hoá hình học route.
 const double _kSimplifyEpsM = 2.5;
@@ -324,7 +328,7 @@ class BleBridge {
     }
 
     _roadsSeq = (_roadsSeq + 1) & 0xFF;
-    for (final frame in _encodeMapRoads(roads, anchor, _roadsSeq, clipped)) {
+    for (final frame in _encodeMapRoads(roads, anchor, _roadsSeq)) {
       _enqueueFrame(frame, _typeMapRoads, withResponse: true, coalesce: false);
     }
   }
@@ -659,8 +663,7 @@ class BleBridge {
   /// MAP_MAX_ROADS theo thứ tự đến nên road lân cận giao cắt (thường là
   /// đường nhỏ) không được xếp đầu sẽ bị rớt nếu chỉ sort theo class.
   List<Uint8List> _encodeMapRoads(
-      List<RoadSegment> roads, GeoPoint anchor, int seq,
-      [List<GeoPoint> routeGeometry = const []]) {
+      List<RoadSegment> roads, GeoPoint anchor, int seq) {
     // Lượng tử hoá từng road; bỏ road có MỌI điểm ngoài cửa sổ ~1.2 km.
     final encoded = <({int cls, double dist, List<({int e, int n})> pts})>[];
     for (final road in roads) {
@@ -670,29 +673,19 @@ class BleBridge {
       for (final p in road.points) {
         final d = anchor.distanceTo(p);
         if (d <= _kMapWindowM) anyInside = true;
+        if (d < minDist) minDist = d; // khoảng cách tới anchor (user)
         final m = _toMeters(p, anchor);
         pts.add((e: _toDm(m.east), n: _toDm(m.north)));
-        if (pts.length >= 255) break; // pt_count u8.
+        if (pts.length >= _kMapMaxRoadPts) break; // khớp giới hạn firmware
       }
       if (!anyInside || pts.length < 2) continue;
-      if (routeGeometry.isEmpty) {
-        for (final p in road.points) {
-          minDist = math.min(minDist, anchor.distanceTo(p));
-        }
-      } else {
-        for (final p in road.points) {
-          for (final r in routeGeometry) {
-            final d = p.distanceTo(r);
-            if (d < minDist) minDist = d;
-          }
-        }
-      }
       encoded.add((cls: road.type.value & 0xFF, dist: minDist, pts: pts));
     }
     if (encoded.isEmpty) return const [];
 
-    // Ưu tiên road gần route (giao cắt) trước, road cùng cự ly thì đường lớn
-    // (class nhỏ) trước; cắt về budget khớp firmware MAP_MAX_ROADS.
+    // Ưu tiên road GẦN ANCHOR (user) trước — đảm bảo ngõ hẻm ngay bên cạnh
+    // luôn được chọn thay vì bị đẩy ra ngoài budget bởi đường xa phía trước.
+    // Cùng cự ly: đường lớn (class nhỏ) trước.
     encoded.sort((a, b) {
       final byDist = a.dist.compareTo(b.dist);
       if (byDist != 0) return byDist;
@@ -706,7 +699,7 @@ class BleBridge {
     final maxBody = _kMaxPayload - headerLen;
 
     // Gom road vào frame; mỗi road = 2 + pts*4 byte. Road không vừa 1 frame
-    // (hiếm) thì cắt bớt điểm. Road gần route ưu tiên do đã sort.
+    // (hiếm) thì cắt bớt điểm.
     final frames = <Uint8List>[];
     var body = BytesBuilder();
     var count = 0;

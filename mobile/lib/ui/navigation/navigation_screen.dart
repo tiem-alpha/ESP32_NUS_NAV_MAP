@@ -46,7 +46,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   // thể trôi ra ngoài cửa sổ clip trước khi resend, làm hụt route/road gần đó.
   final _mapKey = GlobalKey<MapViewState>();
   GeoPoint? _lastMapPosSent;
-  static const _mapPosMoveThresholdM = 15.0;
+  static const _mapPosMoveThresholdM = 5.0; // gửi MAP_POSE mỗi GPS tick (~1 Hz)
   GeoPoint? _lastMapDataCenter;
   static const _mapDataResendThresholdM = 800.0;
 
@@ -127,7 +127,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
           if (mounted) _showArrivalSheet();
         });
       }
-      // Gửi MAP_POSITION mỗi 15m; resend map data mỗi 1.5km.
+      // Gửi MAP_POSITION mỗi 15m; resend map data mỗi ~800m.
       final pos = next.matchedPosition ?? next.currentPosition;
       if (pos != null) {
         final lastPos = _lastMapPosSent;
@@ -142,11 +142,17 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
             speedKmh: next.speedKmh.round(),
             viewSpanM: viewSpanM,
           );
-          final lastCenter = _lastMapDataCenter;
-          if (lastCenter == null ||
-              lastCenter.distanceTo(pos) >= _mapDataResendThresholdM) {
-            _lastMapDataCenter = pos;
-            _trySendMapData(snap: next, center: pos);
+          // Chỉ gửi map data khi đang dẫn đường (isActive). Nếu không guard ở
+          // đây, _lastMapDataCenter bị update sớm trong phase routing → khi
+          // phase chuyển sang navigating không trigger lại vì pos chưa di chuyển
+          // đủ 800 m → route/roads không bao giờ được gửi lần đầu.
+          if (next.isActive) {
+            final lastCenter = _lastMapDataCenter;
+            if (lastCenter == null ||
+                lastCenter.distanceTo(pos) >= _mapDataResendThresholdM) {
+              _lastMapDataCenter = pos;
+              _trySendMapData(snap: next, center: pos);
+            }
           }
         }
       }
@@ -485,9 +491,20 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   }) async {
     final route = snap.route;
     if (route == null || !snap.isActive) return;
-    final roads = await ref
+
+    // Ưu tiên Overpass (bán kính 1.5 km, đầy đủ hơn). Nếu Overpass trả rỗng
+    // (lỗi mạng / timeout), dùng vector tiles của MapLibre làm fallback (~450 m
+    // viewport, không cần network thêm vì tiles đã được tải sẵn).
+    var roads = await ref
         .read(overpassRoadServiceProvider)
         .queryRoadsAround(lat: center.lat, lng: center.lng, radiusM: 1500.0);
+
+    if (roads.isEmpty) {
+      roads = await (_mapKey.currentState?.queryRoadsForMiniMap(
+                center.lat, center.lng) ??
+            const []);
+    }
+
     if (!mounted) return;
     await ref.read(bleBridgeProvider).sendMapData(
       routeGeometry: route.geometry,

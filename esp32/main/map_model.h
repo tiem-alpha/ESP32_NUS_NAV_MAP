@@ -16,8 +16,8 @@ extern "C" {
 #endif
 
 #define MAP_MAX_ROUTE_PTS 200
-#define MAP_MAX_ROADS     32
-#define MAP_MAX_ROAD_PTS  32
+#define MAP_MAX_ROADS     48   /* 32→48: ngõ hẻm VN; pointer-swap nên không tốn thêm mutex time */
+#define MAP_MAX_ROAD_PTS  40   /* tăng từ 32 — đường dài mượt hơn */
 
 typedef struct { int16_t e_dm, n_dm; } map_pt_t; /* north-up dm so với anchor */
 

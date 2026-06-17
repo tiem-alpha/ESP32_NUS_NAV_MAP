@@ -10,7 +10,7 @@ import '../models/road_segment.dart';
 /// Best-effort: mọi lỗi (mạng, parse) đều trả `const []`.
 class OverpassRoadService {
   /// Giới hạn số segment trả về để chặn băng thông BLE (§4.4).
-  static const int _maxSegments = 120;
+  static const int _maxSegments = 200;
 
   final Dio _dio;
   OverpassRoadService(this._dio);
