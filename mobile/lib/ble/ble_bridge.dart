@@ -56,6 +56,8 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
+
 import '../core/event_bus.dart';
 import '../models/ble_device.dart';
 import '../models/geo_point.dart';
@@ -64,6 +66,67 @@ import '../models/nav_state.dart';
 import '../models/road_segment.dart';
 import 'crc16_mcrf4xx.dart';
 import 'i_ble_transport.dart';
+
+/// Snapshot dữ liệu cuối cùng đã gửi cho ESP32 — dùng để HUD sim mobile render
+/// chính xác cùng hình học mà ESP32 đang hiển thị (post DP-simplify + clip).
+class BleMapSnapshot {
+  final GeoPoint user;
+  final double headingDeg;
+  final int speedKmh;
+  final bool navigating;
+  final bool offRoute;
+  final bool gpsFix;
+
+  /// Mét toàn-chiều-rộng màn hình phone → ESP32 dùng suy px_per_dm (MAP_POSE §0x30).
+  final double viewSpanM;
+
+  /// Anchor của bộ hình học route/roads (điểm gốc đã gửi qua MAP_ROUTE/MAP_ROADS).
+  final GeoPoint? anchor;
+
+  /// Tuyến sau Douglas–Peucker + clip cửa sổ 1.2 km — chính xác với ESP32.
+  final List<GeoPoint> route;
+
+  /// Đường xung quanh đã lọc (tham số roads truyền vào sendMapData).
+  final List<RoadSegment> roads;
+
+  const BleMapSnapshot({
+    required this.user,
+    required this.headingDeg,
+    required this.speedKmh,
+    required this.navigating,
+    required this.offRoute,
+    required this.gpsFix,
+    required this.viewSpanM,
+    this.anchor,
+    this.route = const [],
+    this.roads = const [],
+  });
+
+  BleMapSnapshot copyWith({
+    GeoPoint? user,
+    double? headingDeg,
+    int? speedKmh,
+    bool? navigating,
+    bool? offRoute,
+    bool? gpsFix,
+    double? viewSpanM,
+    GeoPoint? anchor,
+    List<GeoPoint>? route,
+    List<RoadSegment>? roads,
+  }) =>
+      BleMapSnapshot(
+        user: user ?? this.user,
+        headingDeg: headingDeg ?? this.headingDeg,
+        speedKmh: speedKmh ?? this.speedKmh,
+        navigating: navigating ?? this.navigating,
+        offRoute: offRoute ?? this.offRoute,
+        gpsFix: gpsFix ?? this.gpsFix,
+        viewSpanM: viewSpanM ?? this.viewSpanM,
+        anchor: anchor ?? this.anchor,
+        route: route ?? this.route,
+        roads: roads ?? this.roads,
+      );
+}
 
 // ── Mã message ─────────────────────────────────────────────────────────
 const int _kSof = 0xA5;
@@ -94,15 +157,15 @@ const double _kRouteLeadInM = 50.0;
 
 // Khớp MAP_MAX_ROADS phía firmware (map_model.h) — road vượt ngưỡng này bị
 // firmware âm thầm bỏ theo thứ tự đến, nên phải tự cắt + ưu tiên ở mobile.
-const int _kMapMaxRoads = 48; // khớp MAP_MAX_ROADS firmware (48 = đủ hẻm VN, ổn định)
+const int _kMapMaxRoads = 64; // khớp MAP_MAX_ROADS firmware; RAM giống cũ (64×122B ≈ 48×162B)
 
 // Số điểm tối đa mỗi road gửi xuống — khớp MAP_MAX_ROAD_PTS firmware. Gửi
 // nhiều hơn chỉ lãng phí băng thông vì firmware sẽ bỏ phần thừa.
-const int _kMapMaxRoadPts = 40;
+const int _kMapMaxRoadPts = 30; // 40→30: ít pts hơn nhưng đổi lấy 33% road nhiều hơn
 
-// Payload tối đa mỗi MAP_ROADS frame — nhỏ hơn _kMaxPayload (200) để tránh
-// "ACL packet too short" / HCI error trên Bluedroid khi packet quá lớn.
-const int _kMapRoadsMaxPayload = 150;
+// Payload tối đa mỗi MAP_ROADS frame — dùng hết MTU (200B) để gom nhiều
+// road/frame hơn, giảm số WR frames cần gửi (MTU 247 → frame 205B ≤ ATT max).
+const int _kMapRoadsMaxPayload = 200;
 
 // Epsilon Douglas–Peucker (mét) — đơn giản hoá hình học route.
 const double _kSimplifyEpsM = 2.5;
@@ -163,6 +226,10 @@ class BleBridge {
   Uint8List? _lastSpeedLimitFrame;
   Uint8List? _lastNavStateFrame;
 
+  // ── BLE map snapshot — dữ liệu cuối gửi cho ESP32 (cho HUD sim mobile) ──
+  BleMapSnapshot? _mapSnapshot;
+  final _mapCtrl = StreamController<BleMapSnapshot>.broadcast();
+
   // Pose gần nhất gửi qua sendMapPosition → nguồn anchor cho sendMapData.
   GeoPoint? _lastPose;
 
@@ -183,6 +250,12 @@ class BleBridge {
   BleStatus get currentStatus => _status;
   Stream<BleStatus> get status => _statusCtrl.stream;
   Stream<ButtonEvent> get buttonEvents => _btnCtrl.stream;
+
+  /// Snapshot dữ liệu map cuối cùng đã gửi cho ESP32 (null nếu chưa gửi lần nào).
+  BleMapSnapshot? get currentMapSnapshot => _mapSnapshot;
+
+  /// Stream phát mỗi khi MAP_POSE hoặc MAP_ROUTE/ROADS được gửi.
+  Stream<BleMapSnapshot> get mapSnapshots => _mapCtrl.stream;
 
   Future<void> connectTo(DiscoveredDevice device) async {
     _intentionalDisconnect = false;
@@ -283,6 +356,7 @@ class BleBridge {
     required double viewSpanM,
   }) {
     _lastPose = GeoPoint(lat, lng);
+    final flags = _poseFlags();
     final b = BytesBuilder();
     _putI32(b, (lat * 1e7).round()); // lat i32 deg×1e7
     _putI32(b, (lng * 1e7).round()); // lng i32 deg×1e7
@@ -290,9 +364,35 @@ class BleBridge {
     final headingDeci = (bearing * 10).round() % 3600;
     _putU16(b, (headingDeci + 3600) % 3600);
     b.addByte(speedKmh.clamp(0, 255)); // speed u8 (km/h)
-    b.addByte(_poseFlags()); // flags u8
+    b.addByte(flags); // flags u8
     _putU16(b, (viewSpanM * 10).round().clamp(1, 65535)); // view_span_dm
     _enqueue(_typeMapPose, b.toBytes(), coalesce: true);
+
+    // Emit snapshot cho HUD sim mobile.
+    final prev = _mapSnapshot;
+    _mapSnapshot = prev == null
+        ? BleMapSnapshot(
+            user: GeoPoint(lat, lng),
+            headingDeg: bearing,
+            speedKmh: speedKmh,
+            navigating: _navigating,
+            offRoute: _offRoute,
+            gpsFix: (flags & 0x01) != 0,
+            viewSpanM: viewSpanM,
+          )
+        : prev.copyWith(
+            user: GeoPoint(lat, lng),
+            headingDeg: bearing,
+            speedKmh: speedKmh,
+            navigating: _navigating,
+            offRoute: _offRoute,
+            gpsFix: (flags & 0x01) != 0,
+            viewSpanM: viewSpanM,
+          );
+    if (prev == null) {
+      debugPrint('[BleBridge] MAP_POSE first send: ${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)} heading=${bearing.round()} viewSpan=${viewSpanM.round()}m');
+    }
+    if (!_mapCtrl.isClosed) _mapCtrl.add(_mapSnapshot!);
   }
 
   /// flags MAP_POSE: bit0 gps_fix (mặc định 1), bit1 off_route, bit2 navigating.
@@ -316,23 +416,43 @@ class BleBridge {
   }) async {
     final anchor = _lastPose ??
         (routeGeometry.isNotEmpty ? routeGeometry.first : null);
-    if (anchor == null) return; // chưa có gốc để chiếu.
+    if (anchor == null) {
+      debugPrint('[BleBridge] sendMapData: anchor=null (lastPose=$_lastPose, routeLen=${routeGeometry.length}) → abort');
+      return;
+    }
 
     // (1) Bỏ phần đã đi, (2) simplify, (3) clip cửa sổ quanh anchor.
     final trimmed = _trimTravelled(routeGeometry, routeProgressM);
     final simplified = _douglasPeucker(trimmed, _kSimplifyEpsM);
     final clipped = _clipToWindow(simplified, anchor);
 
+    debugPrint('[BleBridge] sendMapData: anchor=${anchor.lat.toStringAsFixed(5)},${anchor.lng.toStringAsFixed(5)}'
+        ' route: raw=${routeGeometry.length}→trimmed=${trimmed.length}→dp=${simplified.length}→clip=${clipped.length}'
+        ' roads_in=${roads.length}');
+
+    // Cập nhật snapshot hình học — route chính xác với ESP32 (đã DP + clip).
+    final prev = _mapSnapshot;
+    if (prev != null) {
+      _mapSnapshot = prev.copyWith(anchor: anchor, route: clipped, roads: roads);
+      if (!_mapCtrl.isClosed) _mapCtrl.add(_mapSnapshot!);
+    } else {
+      debugPrint('[BleBridge] sendMapData: _mapSnapshot=null, snapshot NOT updated (no MAP_POSE sent yet?)');
+    }
+
     // withResponse: true — một fragment rớt là hỏng cả lần reassembly trên
     // ESP32 (route/roads không bao giờ hiện); Write-No-Response không đảm
     // bảo gửi tới khi burst nhiều frame liên tiếp như khi fragment route dài.
     _routeSeq = (_routeSeq + 1) & 0xFF;
-    for (final frame in _encodeMapRoute(clipped, anchor, _routeSeq)) {
+    final routeFrames = _encodeMapRoute(clipped, anchor, _routeSeq);
+    debugPrint('[BleBridge] MAP_ROUTE seq=$_routeSeq → ${routeFrames.length} frames (${clipped.length} pts)');
+    for (final frame in routeFrames) {
       _enqueueFrame(frame, _typeMapRoute, withResponse: true, coalesce: false);
     }
 
     _roadsSeq = (_roadsSeq + 1) & 0xFF;
-    for (final frame in _encodeMapRoads(roads, anchor, _roadsSeq)) {
+    final roadsFrames = _encodeMapRoads(roads, anchor, _roadsSeq);
+    debugPrint('[BleBridge] MAP_ROADS seq=$_roadsSeq → ${roadsFrames.length} frames');
+    for (final frame in roadsFrames) {
       _enqueueFrame(frame, _typeMapRoads, withResponse: true, coalesce: false);
     }
   }
@@ -349,6 +469,7 @@ class BleBridge {
     _cancelReconnect();
     _statusCtrl.close();
     _btnCtrl.close();
+    _mapCtrl.close();
     _transport.dispose();
   }
 
@@ -685,7 +806,19 @@ class BleBridge {
       if (!anyInside || pts.length < 2) continue;
       encoded.add((cls: road.type.value & 0xFF, dist: minDist, pts: pts));
     }
-    if (encoded.isEmpty) return const [];
+    final skippedOutside = roads.length - encoded.length;
+    if (encoded.isEmpty) {
+      // Vẫn gửi 1 frame road_count=0 để ESP32 chốt anchor mới và clear roads.
+      // Nếu không gửi, ESP32 giữ road_n cũ với anchor cũ → roads hiển thị sai
+      // vị trí sau khi MAP_ROUTE đến với anchor mới.
+      debugPrint('[MapRoads] _encodeMapRoads: all ${roads.length} roads outside window → send clear frame');
+      final b = BytesBuilder();
+      _putI32(b, (anchor.lat * 1e7).round());
+      _putI32(b, (anchor.lng * 1e7).round());
+      b.addByte(seq & 0xFF);
+      b.addByte(0); // road_count = 0
+      return [_frame(_typeMapRoads, b.toBytes())];
+    }
 
     // Ưu tiên road GẦN ANCHOR (user) trước — đảm bảo ngõ hẻm ngay bên cạnh
     // luôn được chọn thay vì bị đẩy ra ngoài budget bởi đường xa phía trước.
@@ -698,6 +831,8 @@ class BleBridge {
     final budgeted = encoded.length > _kMapMaxRoads
         ? encoded.sublist(0, _kMapMaxRoads)
         : encoded;
+    debugPrint('[MapRoads] _encodeMapRoads: in=${roads.length} outside=$skippedOutside valid=${encoded.length} budgeted=${budgeted.length}/$_kMapMaxRoads'
+        ' (window=${_kMapWindowM.round()}m, maxPts=$_kMapMaxRoadPts)');
 
     const headerLen = 4 + 4 + 1 + 1; // 10 byte
     final maxBody = _kMapRoadsMaxPayload - headerLen; // 140B — tránh HCI error

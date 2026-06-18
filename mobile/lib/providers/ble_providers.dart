@@ -176,3 +176,27 @@ final bleScanProvider = NotifierProvider<BleScanController, BleScanState>(
 final bleAdapterProvider = StreamProvider<bool>((ref) {
   return ref.watch(bleTransportProvider).adapterState;
 });
+
+/// Dữ liệu map cuối cùng đã gửi cho ESP32 — dùng cho HUD sim "BLE Live".
+/// Phát mỗi khi MAP_POSE hoặc MAP_ROUTE/ROADS được encode và enqueue.
+/// Seed bằng currentMapSnapshot để ESP preview không bị kẹt ở "Chờ BLE..."
+/// khi snapshot đã có từ trước (vd: mở preview giữa chừng navigation).
+final bleMapSnapshotProvider = StreamProvider<BleMapSnapshot>((ref) {
+  final bridge = ref.watch(bleBridgeProvider);
+  final initial = bridge.currentMapSnapshot;
+  if (initial == null) return bridge.mapSnapshots;
+
+  // Phát snapshot hiện tại ngay lập tức, sau đó tiếp tục nghe stream.
+  final ctrl = StreamController<BleMapSnapshot>();
+  ctrl.add(initial);
+  final sub = bridge.mapSnapshots.listen(
+    ctrl.add,
+    onError: ctrl.addError,
+    onDone: ctrl.close,
+  );
+  ref.onDispose(() {
+    sub.cancel();
+    ctrl.close();
+  });
+  return ctrl.stream;
+});

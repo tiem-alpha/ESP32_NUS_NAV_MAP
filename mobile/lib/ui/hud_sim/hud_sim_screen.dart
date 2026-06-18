@@ -3,12 +3,14 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../ble/ble_bridge.dart';
 import '../../models/geo_point.dart';
 import '../../models/maneuver_type.dart';
 import '../../models/nav_state.dart';
 import '../../models/road_segment.dart';
 import '../../navigation/nav_controller.dart';
 import '../../providers/app_providers.dart';
+import '../../providers/ble_providers.dart';
 import '../format.dart';
 import '../widgets/maneuver_icon.dart';
 import 'hud_painter.dart';
@@ -36,6 +38,7 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
 
   // --- Cache roads quanh user (READ ONLY service) ---
   List<RoadSegment> _roads = const [];
+  List<RoadSegment> _roadsLastGood = const []; // cache lần query thành công cuối
   GeoPoint? _roadsAnchor; // điểm đã fetch roads gần nhất
   bool _roadsLoading = false;
 
@@ -89,8 +92,29 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
     return (pos: pos, heading: a.bearingTo(b), speed: 43);
   }
 
-  /// Lấy dữ liệu thực tế từ NavSnapshot khi đang dẫn đường, ngược lại demo.
-  _HudData _resolveData(NavSnapshot snap) {
+  /// Lấy dữ liệu: ưu tiên BLE Live (chính xác với ESP32) → NavSnapshot → Demo.
+  _HudData _resolveData(NavSnapshot snap, BleMapSnapshot? bleSnap) {
+    // BLE Live — dùng đúng dữ liệu đã gửi (DP-simplified, zoom khớp ESP32).
+    if (!_demo && bleSnap != null) {
+      return _HudData(
+        user: bleSnap.user,
+        heading: bleSnap.headingDeg,
+        speedKmh: bleSnap.speedKmh.toDouble(),
+        route: bleSnap.route,
+        roads: bleSnap.roads,
+        maneuver: snap.currentManeuverType,
+        distanceToManeuverM: snap.distanceToManeuverM,
+        distanceRemainingM: snap.distanceRemainingM,
+        etaSeconds: snap.etaSeconds,
+        speedLimitKmh: snap.speedLimitKmh,
+        isOverSpeed: snap.isOverSpeed,
+        gpsWeak: !bleSnap.gpsFix,
+        isDemo: false,
+        isBle: true,
+        pxPerMOverride: 240.0 / bleSnap.viewSpanM.clamp(10, 5000),
+      );
+    }
+
     final realActive = !_demo &&
         snap.phase == NavPhase.navigating &&
         snap.route != null &&
@@ -151,12 +175,14 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
   /// Tải roads quanh user khi di chuyển xa anchor cũ (>300 m). Best-effort.
   Future<void> _maybeFetchRoads() async {
     final NavSnapshot snap = ref.read(navControllerProvider);
-    final data = _resolveData(snap);
+    final bleSnap = ref.read(bleMapSnapshotProvider).whenOrNull(data: (s) => s);
+    final data = _resolveData(snap, bleSnap);
     final user = data.user;
     if (_roadsLoading) return;
     final anchor = _roadsAnchor;
     if (anchor != null && anchor.distanceTo(user) < 300) return;
 
+    debugPrint('[HudSim] _maybeFetchRoads: user=${user.lat.toStringAsFixed(5)},${user.lng.toStringAsFixed(5)} anchor=${anchor == null ? "null" : "${anchor.lat.toStringAsFixed(5)},${anchor.lng.toStringAsFixed(5)}"}');
     _roadsLoading = true;
     try {
       final roads = await ref.read(overpassRoadServiceProvider).queryRoadsAround(
@@ -164,13 +190,17 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
             lng: user.lng,
             radiusM: 1500,
           );
+      debugPrint('[HudSim] _maybeFetchRoads: got ${roads.length} roads → setState');
       if (!mounted) return;
+      if (roads.isNotEmpty) _roadsLastGood = roads;
       setState(() {
-        _roads = roads;
+        _roads = roads.isNotEmpty ? roads : _roadsLastGood;
         _roadsAnchor = user;
       });
-    } catch (_) {
-      // Bỏ qua: bản đồ nền là phụ trợ, vẫn vẽ được route + user.
+    } catch (e) {
+      debugPrint('[HudSim] _maybeFetchRoads ERROR: $e');
+      if (!mounted) return;
+      if (_roadsLastGood.isNotEmpty) setState(() => _roads = _roadsLastGood);
     } finally {
       _roadsLoading = false;
     }
@@ -190,7 +220,8 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
   @override
   Widget build(BuildContext context) {
     final snap = ref.watch(navControllerProvider);
-    final data = _resolveData(snap);
+    final bleSnap = ref.watch(bleMapSnapshotProvider).whenOrNull(data: (s) => s);
+    final data = _resolveData(snap, bleSnap);
     final theme = Theme.of(context);
 
     return Scaffold(
@@ -209,7 +240,9 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
                     subtitle: Text(
                       data.isDemo
                           ? 'Đang dùng tuyến & xe mô phỏng'
-                          : 'Đang dùng dữ liệu dẫn đường thật',
+                          : (data.isBle
+                              ? 'BLE Live — dữ liệu thật gửi ESP32'
+                              : 'Dữ liệu NavSnapshot (BLE chưa kết nối)'),
                     ),
                     value: _demo,
                     onChanged: (v) {
@@ -227,7 +260,8 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
               child: _DeviceBezel(
                 child: _HudView(
                   data: data,
-                  roads: _roads,
+                  // BLE Live: roads đã gửi thật; còn lại dùng Overpass local.
+                  roads: data.isBle ? data.roads : _roads,
                   routeColor: theme.colorScheme.primary,
                   roadColor: const Color(0xFF8A8A8E),
                 ),
@@ -248,12 +282,13 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
   }
 }
 
-/// Gói dữ liệu đã chuẩn hoá cho HUD (từ NavSnapshot thật hoặc demo).
+/// Gói dữ liệu đã chuẩn hoá cho HUD (BLE Live / NavSnapshot / Demo).
 class _HudData {
   final GeoPoint user;
   final double heading;
   final double speedKmh;
   final List<GeoPoint> route;
+  final List<RoadSegment> roads;
   final ManeuverType maneuver;
   final double distanceToManeuverM;
   final double distanceRemainingM;
@@ -263,11 +298,18 @@ class _HudData {
   final bool gpsWeak;
   final bool isDemo;
 
+  /// true khi đang dùng dữ liệu thực tế từ BLE (Map_POSE/ROUTE/ROADS).
+  final bool isBle;
+
+  /// Override zoom — khớp chính xác tỉ lệ ESP32 khi có viewSpanM từ MAP_POSE.
+  final double? pxPerMOverride;
+
   const _HudData({
     required this.user,
     required this.heading,
     required this.speedKmh,
     required this.route,
+    this.roads = const [],
     required this.maneuver,
     required this.distanceToManeuverM,
     required this.distanceRemainingM,
@@ -276,6 +318,8 @@ class _HudData {
     required this.isOverSpeed,
     required this.gpsWeak,
     required this.isDemo,
+    this.isBle = false,
+    this.pxPerMOverride,
   });
 }
 
@@ -340,6 +384,7 @@ class _HudView extends StatelessWidget {
             speedKmh: data.speedKmh,
             routeColor: routeColor,
             roadColor: roadColor,
+            pxPerMOverride: data.pxPerMOverride,
           ),
         ),
 
@@ -406,7 +451,10 @@ class _HudView extends StatelessWidget {
           child: Center(
             child: _StatusDot(
               ok: !data.gpsWeak,
-              label: data.isDemo ? 'DEMO' : (data.gpsWeak ? 'GPS yếu' : 'GPS OK'),
+              label: data.isDemo
+                  ? 'DEMO'
+                  : (data.isBle ? 'BLE LIVE' : (data.gpsWeak ? 'GPS yếu' : 'GPS OK')),
+              color: data.isBle ? const Color(0xFF1A73E8) : null,
             ),
           ),
         ),
@@ -473,10 +521,12 @@ class _SpeedLimitBadge extends StatelessWidget {
 class _StatusDot extends StatelessWidget {
   final bool ok;
   final String label;
-  const _StatusDot({required this.ok, required this.label});
+  final Color? color;
+  const _StatusDot({required this.ok, required this.label, this.color});
 
   @override
   Widget build(BuildContext context) {
+    final dotColor = color ?? (ok ? const Color(0xFF34A853) : const Color(0xFFF9AB00));
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
@@ -490,7 +540,7 @@ class _StatusDot extends StatelessWidget {
             width: 8,
             height: 8,
             decoration: BoxDecoration(
-              color: ok ? const Color(0xFF34A853) : const Color(0xFFF9AB00),
+              color: dotColor,
               shape: BoxShape.circle,
             ),
           ),

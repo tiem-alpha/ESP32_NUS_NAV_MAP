@@ -9,6 +9,7 @@ import '../../core/theme/app_typography.dart';
 import '../../models/geo_point.dart';
 import '../../models/maneuver_type.dart';
 import '../../models/nav_state.dart';
+import '../../models/road_segment.dart';
 import '../../navigation/nav_controller.dart';
 import '../../navigation/nav_voice.dart';
 import '../../providers/app_providers.dart';
@@ -16,6 +17,7 @@ import '../../providers/ble_providers.dart';
 import '../../services/nav_foreground_task.dart';
 import '../format.dart';
 import '../map/map_view.dart';
+import '../hud_sim/esp_preview_panel.dart';
 import '../widgets/ble_chip.dart';
 import '../widgets/maneuver_icon.dart';
 import '../widgets/speed_sign.dart';
@@ -40,6 +42,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
 
   bool _arrivedShown = false;
   bool _ending = false;
+  bool _showEspPreview = false;
 
   // MAP_POSITION: gửi vị trí mỗi 15m; resend map binary mỗi ~800m.
   // Phải nhỏ hơn _kMapWindowM (1.2km, ble_bridge.dart) — nếu không anchor có
@@ -171,6 +174,24 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
           ),
           // Ô tốc độ góc dưới-trái.
           Positioned(left: 12, bottom: 96, child: _speedBox(snap)),
+          // Preview ESP32 (góc dưới-phải, ẩn/hiện theo nút toggle).
+          if (_showEspPreview)
+            Positioned(
+              right: 10,
+              bottom: 136,
+              child: EspPreviewPanel(
+                onClose: () => setState(() => _showEspPreview = false),
+              ),
+            ),
+          // Nút toggle ESP32 preview (góc dưới-phải, ngay trên bottom bar).
+          Positioned(
+            right: 10,
+            bottom: 92,
+            child: _EspToggleButton(
+              active: _showEspPreview,
+              onTap: () => setState(() => _showEspPreview = !_showEspPreview),
+            ),
+          ),
           // GPS yếu chip.
           if (snap.gpsWeak)
             Positioned(
@@ -492,20 +513,33 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
     final route = snap.route;
     if (route == null || !snap.isActive) return;
 
+    debugPrint('[MapData] _trySendMapData: center=${center.lat.toStringAsFixed(5)},${center.lng.toStringAsFixed(5)} route=${route.geometry.length}pts progress=${snap.routeProgressM.round()}m');
+
     // Ưu tiên Overpass (bán kính 1.5 km, đầy đủ hơn). Nếu Overpass trả rỗng
     // (lỗi mạng / timeout), dùng vector tiles của MapLibre làm fallback (~450 m
     // viewport, không cần network thêm vì tiles đã được tải sẵn).
-    var roads = await ref
-        .read(overpassRoadServiceProvider)
-        .queryRoadsAround(lat: center.lat, lng: center.lng, radiusM: 1500.0);
+    List<RoadSegment> roads;
+    try {
+      roads = await ref
+          .read(overpassRoadServiceProvider)
+          .queryRoadsAround(lat: center.lat, lng: center.lng, radiusM: 1500.0);
+      debugPrint('[MapData] Overpass → ${roads.length} roads');
+    } catch (e) {
+      debugPrint('[MapData] Overpass ERROR: $e');
+      roads = const [];
+    }
 
     if (roads.isEmpty) {
-      roads = await (_mapKey.currentState?.queryRoadsForMiniMap(
-                center.lat, center.lng) ??
-            const []);
+      final mapState = _mapKey.currentState;
+      final fallback = mapState != null
+          ? await mapState.queryRoadsForMiniMap(center.lat, center.lng)
+          : const <RoadSegment>[];
+      debugPrint('[MapData] MapLibre fallback → ${fallback.length} roads');
+      roads = fallback;
     }
 
     if (!mounted) return;
+    debugPrint('[MapData] sendMapData: ${roads.length} roads total');
     await ref.read(bleBridgeProvider).sendMapData(
       routeGeometry: route.geometry,
       roads: roads,
@@ -521,10 +555,12 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   }
 
   Future<void> _updateForegroundNotification(NavSnapshot snap) async {
+    if (!mounted) return;
     final man = snap.currentManeuver;
     final endText = context.l10n.end;
     if (man == null) return;
     if (!await FlutterForegroundTask.isRunningService) return;
+    if (!mounted) return;
     await FlutterForegroundTask.updateService(
       notificationTitle:
           'NavHUD · ${UiFormat.distance(snap.distanceToManeuverM)}',
@@ -585,6 +621,32 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Nút nhỏ toggle ESP32 preview (góc dưới-phải màn hình dẫn đường).
+class _EspToggleButton extends StatelessWidget {
+  final bool active;
+  final VoidCallback onTap;
+
+  const _EspToggleButton({required this.active, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 36,
+        height: 36,
+        decoration: BoxDecoration(
+          color: active ? const Color(0xFF1A73E8) : Colors.black54,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white30, width: 1),
+          boxShadow: const [BoxShadow(color: Colors.black38, blurRadius: 4)],
+        ),
+        child: const Icon(Icons.monitor, color: Colors.white, size: 18),
       ),
     );
   }

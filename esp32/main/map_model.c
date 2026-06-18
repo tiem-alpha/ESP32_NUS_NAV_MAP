@@ -86,6 +86,11 @@ static void map_on_route(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
     if (frag_total == 0) return;
 
     if (frag_idx == 0) {
+        /* Anchor thay đổi (resend sau ~800 m di chuyển): roads cũ không còn
+         * hợp lệ với anchor mới → xoá để tránh hiển thị roads lệch 800 m
+         * trong khoảng trống giữa MAP_ROUTE hoàn thành và MAP_ROADS đến. */
+        bool anchor_changed = (seq != s_route_seq);
+        if (anchor_changed) s_back.road_n = 0;
         s_back.anchor_lat_e7 = anchor_lat;
         s_back.anchor_lng_e7 = anchor_lng;
         s_back.route_n       = 0;
@@ -93,6 +98,9 @@ static void map_on_route(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
         s_route_frag_total   = frag_total;
         s_route_next_frag    = 0;
         s_route_active       = true;
+        ESP_LOGI(MAP_TAG, "route seq=%u frags=%u anchor=(%ld,%ld)%s",
+                 seq, frag_total, anchor_lat, anchor_lng,
+                 anchor_changed ? " [anchor→reset roads]" : "");
     }
 
     if (!s_route_active || seq != s_route_seq || frag_idx != s_route_next_frag) {
@@ -163,7 +171,7 @@ static void map_on_roads(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
 
     s_back_roads_ready = true;
     map_swap_to_front();
-    ESP_LOGI(MAP_TAG, "roads: %u (seq %u)", s_back.road_n, seq);
+    ESP_LOGI(MAP_TAG, "roads frame: road_n=%u (seq=%u frame had %u roads)", s_back.road_n, seq, road_count);
 }
 
 void map_model_init(void)

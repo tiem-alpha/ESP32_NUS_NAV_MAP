@@ -45,6 +45,10 @@ class HudPainter extends CustomPainter {
   /// Màu đường nền (theo theme).
   final Color roadColor;
 
+  /// Override px/m thay vì tính từ speed — dùng khi có viewSpanM từ MAP_POSE
+  /// để khớp chính xác zoom ESP32 (`HudFrame.width / viewSpanM`).
+  final double? pxPerMOverride;
+
   HudPainter({
     required this.user,
     required this.headingDeg,
@@ -53,11 +57,13 @@ class HudPainter extends CustomPainter {
     required this.speedKmh,
     required this.routeColor,
     required this.roadColor,
+    this.pxPerMOverride,
   });
 
-  /// Số mét trên mỗi mét-thực-tế-chiếu… thực chất là **px/mét** ở khung 240×320,
-  /// auto theo tốc độ: đứng yên zoom gần (0,9 px/m), chạy nhanh zoom xa (0,35).
+  /// px/mét tại khung 240×320. Nếu có override (từ viewSpanM của MAP_POSE) dùng
+  /// đúng zoom ESP32; ngược lại tính từ speed (đứng yên gần, chạy nhanh xa).
   double get _pxPerM {
+    if (pxPerMOverride != null) return pxPerMOverride!;
     // 0..80 km/h → 0,9..0,35 px/m (nội suy tuyến tính, kẹp biên).
     final t = (speedKmh.clamp(0, 80)) / 80.0;
     return 0.9 - 0.55 * t;
@@ -150,10 +156,9 @@ class HudPainter extends CustomPainter {
     return path;
   }
 
-  /// Phép chiếu lõi — sao chép math firmware (DESIGN §7):
-  ///   east_m  = (lng - anchor.lng) * cos(anchor.lat) * 111320
-  ///   north_m = (lat - anchor.lat) * 111320
-  ///   xr =  east·cosθ + north·sinθ ; yr = -east·sinθ + north·cosθ
+  /// Phép chiếu lõi — khớp CHÍNH XÁC firmware projection.c:
+  ///   xr = east·cosH - north·sinH   (giống: de*cos_h - dn*sin_h)
+  ///   yr = east·sinH + north·cosH   (giống: de*sin_h + dn*cos_h)
   ///   x = USER_X + xr·pxPerM ; y = USER_Y - yr·pxPerM
   Offset _project(
     GeoPoint p,
@@ -164,8 +169,8 @@ class HudPainter extends CustomPainter {
   ) {
     final eastM = (p.lng - user.lng) * cosLat * 111320.0;
     final northM = (p.lat - user.lat) * 111320.0;
-    final xr = eastM * cosH + northM * sinH;
-    final yr = -eastM * sinH + northM * cosH;
+    final xr = eastM * cosH - northM * sinH;
+    final yr = eastM * sinH + northM * cosH;
     final x = HudFrame.userX + xr * pxPerM;
     final y = HudFrame.userY - yr * pxPerM;
     return Offset(x, y);
@@ -219,6 +224,7 @@ class HudPainter extends CustomPainter {
         old.roads != roads ||
         old.speedKmh != speedKmh ||
         old.routeColor != routeColor ||
-        old.roadColor != roadColor;
+        old.roadColor != roadColor ||
+        old.pxPerMOverride != pxPerMOverride;
   }
 }
