@@ -6,6 +6,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import '../../core/l10n/app_localizations.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/theme/app_typography.dart';
+import '../../models/ble_device.dart';
 import '../../models/geo_point.dart';
 import '../../models/maneuver_type.dart';
 import '../../models/nav_state.dart';
@@ -44,14 +45,14 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   bool _ending = false;
   bool _showEspPreview = false;
 
-  // MAP_POSITION: gửi vị trí mỗi 15m; resend map binary mỗi ~800m.
+  // MAP_POSITION: gửi vị trí mỗi 5m; resend map binary mỗi ~300m.
   // Phải nhỏ hơn _kMapWindowM (1.2km, ble_bridge.dart) — nếu không anchor có
   // thể trôi ra ngoài cửa sổ clip trước khi resend, làm hụt route/road gần đó.
   final _mapKey = GlobalKey<MapViewState>();
   GeoPoint? _lastMapPosSent;
   static const _mapPosMoveThresholdM = 5.0; // gửi MAP_POSE mỗi GPS tick (~1 Hz)
   GeoPoint? _lastMapDataCenter;
-  static const _mapDataResendThresholdM = 800.0;
+  static const _mapDataResendThresholdM = 100.0;
 
   // Fallback view_span_dm trước khi MapView layout xong (xem viewSpanMAt).
   static const _defaultViewSpanM = 200.0;
@@ -117,6 +118,19 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   Widget build(BuildContext context) {
     final snap = ref.watch(navControllerProvider);
 
+    // BLE reconnect → xoá cả hai pos-cache để GPS tick kế tiếp gửi lại ngay.
+    // _lastMapPosSent phải reset: nếu device đứng yên (<5m) sau reconnect,
+    // outer gate không thỏa → cả MAP_POSE lẫn map data đều không được gửi.
+    ref.listen<AsyncValue<BleStatus>>(bleStatusProvider, (prev, next) {
+      final prevState = prev?.value?.state;
+      final nextState = next.value?.state;
+      if (prevState != BleConnectionState.connected &&
+          nextState == BleConnectionState.connected) {
+        _lastMapDataCenter = null;
+        _lastMapPosSent = null;
+      }
+    });
+
     // Hiện arrival sheet một lần khi tới nơi; cập nhật notification dẫn đường.
     ref.listen<NavSnapshot>(navControllerProvider, (prev, next) {
       // Update foreground service notification with current instruction.
@@ -154,7 +168,11 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
             if (lastCenter == null ||
                 lastCenter.distanceTo(pos) >= _mapDataResendThresholdM) {
               _lastMapDataCenter = pos;
-              _trySendMapData(snap: next, center: pos);
+              _trySendMapData(snap: next, center: pos).then((sent) {
+                // Rollback nếu không gửi được (Overpass lỗi + fallback rỗng):
+                // giữ lastCenter cũ để GPS tick tiếp theo retry ngay.
+                if (!sent && mounted) _lastMapDataCenter = lastCenter;
+              });
             }
           }
         }
@@ -506,12 +524,14 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
     if (ok == true) _endNavigation();
   }
 
-  Future<void> _trySendMapData({
+  /// Trả true nếu đã gửi (dù roads rỗng vẫn tính là gửi).
+  /// Trả false nếu điều kiện không thỏa (route null / phase sai / unmounted).
+  Future<bool> _trySendMapData({
     required NavSnapshot snap,
     required GeoPoint center,
   }) async {
     final route = snap.route;
-    if (route == null || !snap.isActive) return;
+    if (route == null || !snap.isActive) return false;
 
     debugPrint('[MapData] _trySendMapData: center=${center.lat.toStringAsFixed(5)},${center.lng.toStringAsFixed(5)} route=${route.geometry.length}pts progress=${snap.routeProgressM.round()}m');
 
@@ -538,13 +558,14 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
       roads = fallback;
     }
 
-    if (!mounted) return;
+    if (!mounted) return false;
     debugPrint('[MapData] sendMapData: ${roads.length} roads total');
     await ref.read(bleBridgeProvider).sendMapData(
       routeGeometry: route.geometry,
       roads: roads,
       routeProgressM: snap.routeProgressM,
     );
+    return true;
   }
 
   void _endNavigation() {
