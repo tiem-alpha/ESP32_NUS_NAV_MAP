@@ -241,6 +241,11 @@ class BleBridge {
   Uint8List? _lastSpeedLimitFrame;
   Uint8List? _lastNavStateFrame;
 
+  // ── Dedup mũi tên rẽ — chỉ gửi NAV_INSTRUCTION khi thực sự đổi ──────
+  int _lastSentManeuverWire = -1;
+  int _lastSentExitNumber = -1;
+  String _lastSentManeuverStreet = '';
+
   // ── BLE map snapshot — dữ liệu cuối gửi cho ESP32 (cho HUD sim mobile) ──
   BleMapSnapshot? _mapSnapshot;
   final _mapCtrl = StreamController<BleMapSnapshot>.broadcast();
@@ -362,8 +367,15 @@ class BleBridge {
     _navigating = false;
     _offRoute = false;
     _instructionSeq = 0;
+    _resetManeuverDedup();
     _status = const BleStatus(); // về unpaired, xoá device/info.
     _setStatus(_status);
+  }
+
+  void _resetManeuverDedup() {
+    _lastSentManeuverWire = -1;
+    _lastSentExitNumber = -1;
+    _lastSentManeuverStreet = '';
   }
 
   /// Gửi NAV_INSTRUCTION mẫu cho nút [Gửi thử] ở S5 (§11.7).
@@ -533,15 +545,27 @@ class BleBridge {
       case InstructionChanged():
         _instructionSeq = e.seq & 0xFF;
         final m = e.maneuver;
+        final mWire = m.type.wire;
+        final exitNum = m.exitNumber ?? 0;
         final frame = _encodeNavInstruction(
-          maneuverWire: m.type.wire,
+          maneuverWire: mWire,
           distanceM: m.distanceToNextM.round(),
-          exitNumber: m.exitNumber ?? 0,
+          exitNumber: exitNum,
           streetName: m.streetName,
         );
+        // Luôn cập nhật snapshot để resend đúng sau reconnect.
         _lastInstructionFrame = frame;
-        // NAV_INSTRUCTION không bao giờ bị drop → withResponse, không coalesce.
-        _enqueueFrame(frame, _typeNavInstruction, withResponse: true);
+        // Chỉ gửi khi mũi tên / tên đường thực sự đổi; distance_to_man
+        // thay đổi liên tục nhưng đã có DISTANCE_TICK riêng — không cần resend.
+        final sameArrow = mWire == _lastSentManeuverWire &&
+            exitNum == _lastSentExitNumber &&
+            m.streetName == _lastSentManeuverStreet;
+        if (!sameArrow) {
+          _lastSentManeuverWire = mWire;
+          _lastSentExitNumber = exitNum;
+          _lastSentManeuverStreet = m.streetName;
+          _enqueueFrame(frame, _typeNavInstruction, withResponse: true);
+        }
 
       case DistanceTick():
         final b = BytesBuilder();
@@ -574,6 +598,8 @@ class BleBridge {
         _navigating =
             e.phase == NavPhase.navigating || e.phase == NavPhase.rerouting;
         _offRoute = e.phase == NavPhase.rerouting;
+        // Thoát nav → reset dedup mũi tên để lần nav kế tiếp gửi ngay.
+        if (!_navigating) _resetManeuverDedup();
         final frame = _frame(_typeNavState, [_navStateWire(e.phase.wire)]);
         _lastNavStateFrame = frame;
         // NAV_STATE quan trọng → withResponse.
@@ -589,6 +615,7 @@ class BleBridge {
       case Arrived():
         _navigating = false;
         _offRoute = false;
+        _resetManeuverDedup();
         final frame = _frame(_typeNavState, [3]);
         _lastNavStateFrame = frame;
         _enqueueFrame(frame, _typeNavState, withResponse: true);
