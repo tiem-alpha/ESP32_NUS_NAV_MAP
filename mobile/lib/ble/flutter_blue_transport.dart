@@ -101,7 +101,7 @@ class FlutterBlueTransport implements IBleTransport {
     );
     debugPrint('[BleTransport] connect: GATT connected, requestMtu…');
 
-    // MTU 247 (Android). iOS bỏ qua (tự negotiate).
+    // MTU 500 (Android). iOS bỏ qua (tự negotiate).
     try {
       _mtu = await device.requestMtu(Nus.desiredMtu);
     } catch (e) {

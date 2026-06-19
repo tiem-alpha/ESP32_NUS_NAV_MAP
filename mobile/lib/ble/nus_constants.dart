@@ -18,5 +18,5 @@ class Nus {
   static const String txCharUuid = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E';
 
   /// MTU mong muốn khi negotiate trên Android (§5.2). iOS tự negotiate.
-  static const int desiredMtu = 247;
+  static const int desiredMtu = 500;
 }

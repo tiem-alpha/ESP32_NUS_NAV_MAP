@@ -52,7 +52,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   GeoPoint? _lastMapPosSent;
   static const _mapPosMoveThresholdM = 5.0; // gửi MAP_POSE mỗi GPS tick (~1 Hz)
   GeoPoint? _lastMapDataCenter;
-  static const _mapDataResendThresholdM = 100.0;
+  static const _mapDataResendThresholdM = 70.0;
 
   // Fallback view_span_dm trước khi MapView layout xong (xem viewSpanMAt).
   static const _defaultViewSpanM = 200.0;
@@ -144,26 +144,22 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
           if (mounted) _showArrivalSheet();
         });
       }
-      // Gửi MAP_POSITION mỗi 15m; resend map data mỗi ~800m.
+      // Gửi MAP_POSITION mỗi 5m; resend map data mỗi ~70m.
       final pos = next.matchedPosition ?? next.currentPosition;
       if (pos != null) {
         final lastPos = _lastMapPosSent;
         if (lastPos == null || lastPos.distanceTo(pos) >= _mapPosMoveThresholdM) {
           _lastMapPosSent = pos;
-          final viewSpanM =
-              _mapKey.currentState?.viewSpanMAt(pos.lat) ?? _defaultViewSpanM;
+        final viewSpanM =
+            _mapKey.currentState?.viewSpanMAt(pos.lat) ?? _defaultViewSpanM;
           ref.read(bleBridgeProvider).sendMapPosition(
-            lat: pos.lat,
-            lng: pos.lng,
-            bearing: next.bearing,
-            speedKmh: next.speedKmh.round(),
-            viewSpanM: viewSpanM,
-          );
-          // Chỉ gửi map data khi đang dẫn đường (isActive). Nếu không guard ở
-          // đây, _lastMapDataCenter bị update sớm trong phase routing → khi
-          // phase chuyển sang navigating không trigger lại vì pos chưa di chuyển
-          // đủ 800 m → route/roads không bao giờ được gửi lần đầu.
-          if (next.isActive) {
+              lat: pos.lat,
+              lng: pos.lng,
+              bearing: next.bearing,
+              speedKmh: next.speedKmh.round(),
+              viewSpanM: viewSpanM,
+            );
+        if (next.isActive) {
             final lastCenter = _lastMapDataCenter;
             if (lastCenter == null ||
                 lastCenter.distanceTo(pos) >= _mapDataResendThresholdM) {
@@ -539,32 +535,32 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
     // (lỗi mạng / timeout), dùng vector tiles của MapLibre làm fallback (~450 m
     // viewport, không cần network thêm vì tiles đã được tải sẵn).
     List<RoadSegment> roads;
-    try {
-      roads = await ref
-          .read(overpassRoadServiceProvider)
-          .queryRoadsAround(lat: center.lat, lng: center.lng, radiusM: 1500.0);
-      debugPrint('[MapData] Overpass → ${roads.length} roads');
-    } catch (e) {
-      debugPrint('[MapData] Overpass ERROR: $e');
-      roads = const [];
-    }
+      try {
+        roads = await ref
+            .read(overpassRoadServiceProvider)
+          .queryRoadsAround(lat: center.lat, lng: center.lng, radiusM: 500.0);
+        debugPrint('[MapData] Overpass → ${roads.length} roads');
+      } catch (e) {
+        debugPrint('[MapData] Overpass ERROR: $e');
+        roads = const [];
+      }
 
-    if (roads.isEmpty) {
-      final mapState = _mapKey.currentState;
-      final fallback = mapState != null
-          ? await mapState.queryRoadsForMiniMap(center.lat, center.lng)
-          : const <RoadSegment>[];
-      debugPrint('[MapData] MapLibre fallback → ${fallback.length} roads');
-      roads = fallback;
+      if (roads.isEmpty) {
+        final mapState = _mapKey.currentState;
+        final fallback = mapState != null
+            ? await mapState.queryRoadsForMiniMap(center.lat, center.lng)
+            : const <RoadSegment>[];
+        debugPrint('[MapData] MapLibre fallback → ${fallback.length} roads');
+        roads = fallback;
     }
 
     if (!mounted) return false;
     debugPrint('[MapData] sendMapData: ${roads.length} roads total');
     await ref.read(bleBridgeProvider).sendMapData(
-      routeGeometry: route.geometry,
-      roads: roads,
-      routeProgressM: snap.routeProgressM,
-    );
+          routeGeometry: route.geometry,
+          roads: roads,
+          routeProgressM: snap.routeProgressM,
+        );
     return true;
   }
 

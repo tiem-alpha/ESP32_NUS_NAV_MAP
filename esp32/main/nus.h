@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 #define NUS_DEVICE_NAME "Tiem NUS"
-#define NUS_MAX_DATA_LEN 500
+#define NUS_MAX_DATA_LEN 512
 #define NUS_TX_QUEUE_LEN 10
 
 #define NUS_CONFIG_DEFAULT() { \

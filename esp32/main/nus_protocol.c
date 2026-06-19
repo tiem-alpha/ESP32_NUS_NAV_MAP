@@ -38,7 +38,8 @@ typedef struct {
 typedef enum {
     ST_WAIT_SOF = 0,
     ST_TYPE,
-    ST_LEN,
+    ST_LEN_LO,
+    ST_LEN_HI,
     ST_PAYLOAD,
     ST_CRC_LO,
     ST_CRC_HI,
@@ -47,7 +48,7 @@ typedef enum {
 typedef struct {
     proto_state_e state;
     uint8_t       type;
-    uint8_t       len;
+    uint16_t      len;
     uint16_t      idx;     /* số byte payload đã nhận */
     uint8_t       crc_lo;
     uint8_t       payload[NAV_PROTO_MAX_PAYLOAD];
@@ -148,14 +149,9 @@ void nus_protocol_register(uint8_t type, nus_proto_handler_t handler, void *ctx)
 static void proto_dispatch(uint8_t type, const uint8_t *payload, uint16_t len)
 {
     if (s_auto_ack) {
-        if (type == MSG_NAV_INSTRUCTION) {
-            /* seq = payload[0] (xem §6.3). */
-            uint8_t seq = (len >= 1) ? payload[0] : 0;
-            nus_protocol_send_ack(type, seq);
-        } else if (type == MSG_NAV_STATE) {
-            /* NAV_STATE không có seq → ack seq 0. */
-            nus_protocol_send_ack(type, 0);
-        }
+        /* ACK mọi frame; seq = payload[0] chỉ có nghĩa với NAV_INSTRUCTION. */
+        uint8_t seq = (type == MSG_NAV_INSTRUCTION && len >= 1) ? payload[0] : 0;
+        nus_protocol_send_ack(type, seq);
     }
 
     proto_entry_t *e = proto_find(type);
@@ -182,17 +178,22 @@ void nus_protocol_feed(const uint8_t *data, uint16_t len)
 
         case ST_TYPE:
             s_parser.type  = byte;
-            s_parser.state = ST_LEN;
+            s_parser.state = ST_LEN_LO;
             break;
 
-        case ST_LEN:
+        case ST_LEN_LO:
             s_parser.len = byte;
+            s_parser.state = ST_LEN_HI;
+            break;
+
+        case ST_LEN_HI:
+            s_parser.len |= (uint16_t)byte << 8;
             s_parser.idx = 0;
-            if (byte > NAV_PROTO_MAX_PAYLOAD) {
+            if (s_parser.len > NAV_PROTO_MAX_PAYLOAD) {
                 /* LEN bất hợp lệ → bỏ, resync (quét 0xA5 kế tiếp). */
                 s_parser.state = ST_WAIT_SOF;
             } else {
-                s_parser.state = (byte == 0) ? ST_CRC_LO : ST_PAYLOAD;
+                s_parser.state = (s_parser.len == 0) ? ST_CRC_LO : ST_PAYLOAD;
             }
             break;
 
@@ -213,8 +214,12 @@ void nus_protocol_feed(const uint8_t *data, uint16_t len)
 
             /* CRC tính trên TYPE + LEN + PAYLOAD (init 0xFFFF, poly 0x8408). */
             uint16_t crc = 0xFFFF;
-            const uint8_t prefix[2] = { s_parser.type, s_parser.len };
-            for (int k = 0; k < 2; k++) {
+            const uint8_t prefix[3] = {
+                s_parser.type,
+                (uint8_t)(s_parser.len & 0xFF),
+                (uint8_t)(s_parser.len >> 8),
+            };
+            for (int k = 0; k < 3; k++) {
                 crc ^= (uint16_t)prefix[k];
                 for (int b = 0; b < 8; b++) {
                     crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0x8408) : (uint16_t)(crc >> 1);
@@ -256,21 +261,22 @@ esp_err_t nus_protocol_send(uint8_t type, const uint8_t *payload, uint16_t len)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* SOF | TYPE | LEN | PAYLOAD | CRC(2) */
-    static uint8_t buf[3 + NAV_PROTO_MAX_PAYLOAD + 2];
+    /* SOF | TYPE | LEN(u16) | PAYLOAD | CRC(2) */
+    static uint8_t buf[4 + NAV_PROTO_MAX_PAYLOAD + 2];
     buf[0] = NAV_PROTO_SOF;
     buf[1] = type;
-    buf[2] = (uint8_t)len;
+    buf[2] = (uint8_t)(len & 0xFF);
+    buf[3] = (uint8_t)(len >> 8);
     if (len > 0) {
-        memcpy(&buf[3], payload, len);
+        memcpy(&buf[4], payload, len);
     }
 
-    /* CRC trên TYPE + LEN + PAYLOAD = buf[1 .. 3+len). */
-    uint16_t crc = nav_crc16_mcrf4xx(&buf[1], (size_t)len + 2);
-    buf[3 + len]     = (uint8_t)(crc & 0xFF);
-    buf[3 + len + 1] = (uint8_t)((crc >> 8) & 0xFF);
+    /* CRC trên TYPE + LEN16 + PAYLOAD = buf[1 .. 4+len). */
+    uint16_t crc = nav_crc16_mcrf4xx(&buf[1], (size_t)len + 3);
+    buf[4 + len]     = (uint8_t)(crc & 0xFF);
+    buf[4 + len + 1] = (uint8_t)((crc >> 8) & 0xFF);
 
-    uint16_t total = (uint16_t)(3 + len + 2);
+    uint16_t total = (uint16_t)(4 + len + 2);
     return s_tx(buf, total, PROTO_TX_WAIT_MS);
 }
 

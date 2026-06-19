@@ -1,7 +1,7 @@
 /*
  * nav_proto.h — Hợp đồng wire dùng chung với app Flutter.
  * Nguồn chân lý: ../../mobile/thiet-ke-ung-dung-chi-duong-ble-nus.md §5–6.
- * Frame: SOF(0xA5) | TYPE(u8) | LEN(u8 ≤200) | PAYLOAD | CRC16/MCRF4XX(u16 LE).
+ * Frame: SOF(0xA5) | TYPE(u8) | LEN(u16 LE <=500) | PAYLOAD | CRC16/MCRF4XX(u16 LE).
  * Mọi số multi-byte little-endian. KHÔNG đổi giá trị enum (chỉ append).
  */
 #pragma once
@@ -15,7 +15,7 @@ extern "C" {
 
 #define NAV_PROTO_SOF          0xA5
 #define NAV_PROTO_VER          1
-#define NAV_PROTO_MAX_PAYLOAD  200
+#define NAV_PROTO_MAX_PAYLOAD  500
 
 /* Message TYPE (§6.2) */
 enum {

@@ -314,7 +314,7 @@ static void build_ui(void)
 
     /* ── Overlay TRÊN-TRÁI: mũi tên rẽ + khoảng cách + tên đường. ── */
     lv_obj_t *top_left = make_panel(scr);
-    lv_obj_set_size(top_left, 150, 56);
+    lv_obj_set_size(top_left, 240, 50 );
     lv_obj_align(top_left, LV_ALIGN_TOP_LEFT, 4, 4);
 
     s_turn_label = lv_label_create(top_left);
@@ -388,16 +388,16 @@ static void build_ui(void)
     lv_obj_set_style_bg_color(s_ble_dot, s_connected ? COL_DOT_ON : COL_DOT_OFF, 0);
     lv_obj_set_style_bg_opa(s_ble_dot, LV_OPA_COVER, 0);
 
-    /* ── Đồng hồ thực, ngay dưới chấm BLE (giữa-trên). ── */
-    lv_obj_t *clock_panel = make_panel(scr);
-    lv_obj_set_size(clock_panel, 64, 24);
-    lv_obj_align(clock_panel, LV_ALIGN_TOP_MID, 0, 22);
+    // /* ── Đồng hồ thực, ngay dưới chấm BLE (giữa-trên). ── */
+    // lv_obj_t *clock_panel = make_panel(scr);
+    // lv_obj_set_size(clock_panel, 64, 24);
+    // lv_obj_align(clock_panel, LV_ALIGN_TOP_MID, 0, 22);
 
-    s_clock_label = lv_label_create(clock_panel);
-    lv_obj_set_style_text_font(s_clock_label, &lv_font_montserrat_14, 0);
+    s_clock_label = lv_label_create(top_left);
+    lv_obj_set_style_text_font(s_clock_label, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(s_clock_label, COL_TEXT, 0);
     lv_label_set_text(s_clock_label, "--:--");
-    lv_obj_center(s_clock_label);
+    lv_obj_align(s_clock_label, LV_ALIGN_TOP_RIGHT, 0, 0);
 
     s_ui_ready = true;
 }

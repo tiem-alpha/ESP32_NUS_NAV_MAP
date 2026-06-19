@@ -62,9 +62,9 @@ Key folders under `mobile/lib/`: `ble/`, `routing/`, `search/`, `traffic/`, `nav
 
 ## BLE Protocol (source of truth: design §5–6)
 
-NUS service `6E400001-…`, RX (phone→device write) `…0002-…`, TX (device→phone notify) `…0003-…`. Negotiated MTU 247. All multi-byte **little-endian**.
+NUS service `6E400001-…`, RX (phone→device write) `…0002-…`, TX (device→phone notify) `…0003-…`. Negotiated MTU 500 (Android); iOS self-negotiates. All multi-byte **little-endian**.
 
-**Frame:** `SOF(0xA5) | TYPE(u8) | LEN(u8, ≤200) | PAYLOAD | CRC16/MCRF4XX(u16 LE)`. CRC over `TYPE+LEN+PAYLOAD`. Byte-stream parser (SOF→TYPE→LEN→PAYLOAD→CRC) tolerant of BLE fragmentation. CRC self-test: `"123456789" → 0x6F91` (impl: `lib/ble/crc16_mcrf4xx.dart`).
+**Frame:** `SOF(0xA5) | TYPE(u8) | LEN(u16 LE, ≤500) | PAYLOAD | CRC16/MCRF4XX(u16 LE)`. CRC over `TYPE+LEN16+PAYLOAD`. Byte-stream parser (SOF→TYPE→LEN_LO→LEN_HI→PAYLOAD→CRC) tolerant of BLE fragmentation. CRC self-test: `"123456789" → 0x6F91` (impl: `lib/ble/crc16_mcrf4xx.dart`).
 
 **Messages:** banner/HUD info (App→Dev) `0x01 HELLO`, `0x02 DEVICE_INFO` (Dev→App), `0x10 NAV_INSTRUCTION`, `0x11 DISTANCE_TICK`, `0x12 SPEED_LIMIT`, `0x13 TRAFFIC_SIGN`, `0x14 NAV_STATE`, `0x20 ACK` (Dev→App), `0x21 BTN_EVENT` (Dev→App), `0x7E HEARTBEAT`. Full-screen map extension (§6.2.1): `0x30 MAP_POSE`, `0x31 MAP_ROUTE`, `0x32 MAP_ROADS`.
 
@@ -76,10 +76,9 @@ NUS service `6E400001-…`, RX (phone→device write) `…0002-…`, TX (device�
 
 ESP32 renders the map **full-screen** with nav info overlaid; **ESP32 does the projection** (the app doesn't know HUD screen size).
 - App sends `MAP_POSE` frequently (~2 Hz: absolute lat/lng deg×1e7, heading, speed, flags).
-- App sends `MAP_ROUTE`/`MAP_ROADS` rarely (start/reroute or anchor moved >~800 m): geometry as **north-up east/north decimetre offsets** around an absolute `anchor`, simplified + clipped to a ~1.2 km window, fragmented across frames by `seq`/`frag_idx`.
+- App sends `MAP_ROUTE`/`MAP_ROADS` **continuously during active nav (~2 Hz)**: geometry as **north-up east/north decimetre offsets** around an absolute `anchor` (current user pos), simplified + clipped to a ~1.2 km window, fragmented across frames by `seq`/`frag_idx`. Roads are re-fetched from Overpass only every ~15 s or 100 m; between refreshes the cached geometry is re-encoded with updated anchor.
 - ESP32 each frame translates anchor→live user, rotates by −heading (heading-up), scales by zoom, places user bottom-center. North-up offsets mean **heading changes need no resend**.
-
-Bandwidth rule: only MAP_POSE is frequent; route/roads are infrequent — don't resend bulk geometry every position tick.
+- Multiple frames with the same `withResponse` are coalesced into one ATT write (up to MTU−3 = 497 B). Frames larger than 497 B are split byte-stream-safely by `_writeChunks`; the ESP32 parser is stateful and reassembles across writes.
 
 ## Architecture — ESP32 (see `esp32/DESIGN.md`)
 

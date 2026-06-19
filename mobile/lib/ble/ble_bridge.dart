@@ -5,8 +5,8 @@
 // frame tương ứng và đẩy xuống thiết bị. UI và HUD cùng render từ một nguồn.
 //
 // ── KHUNG (frame) — §6.1 ────────────────────────────────────────────────
-//   SOF(0xA5) | TYPE(u8) | LEN(u8, 0..200) | PAYLOAD | CRC16(u16 LE)
-//   CRC16/MCRF4XX tính trên TYPE + LEN + PAYLOAD. Mọi số multi-byte = LE.
+//   SOF(0xA5) | TYPE(u8) | LEN(u16 LE, 0..500) | PAYLOAD | CRC16(u16 LE)
+//   CRC16/MCRF4XX tính trên TYPE + LEN16 + PAYLOAD. Mọi số multi-byte = LE.
 //
 // ── BẢNG MESSAGE chuẩn (§6.2) ───────────────────────────────────────────
 //   0x01 HELLO          App→Dev  proto_ver u8
@@ -28,10 +28,10 @@
 //   gửi hình học ở hệ MÉT ĐỊA LÝ north-up quanh một điểm anchor tuyệt đối.
 //   Đổi heading KHÔNG cần gửi lại route/roads — chỉ MAP_POSE đổi.
 //
-//   Băng thông: chỉ MAP_POSE gửi thường xuyên (~2 Hz, Write-No-Response,
-//   coalesce). MAP_ROUTE/MAP_ROADS gửi hiếm (bắt đầu/reroute/rời anchor);
-//   trước khi gửi: trim phần đã đi + simplify (Douglas–Peucker) + clip cửa
-//   sổ ~1.2 km quanh anchor.
+//   Reliability: mọi frame ACK-gated (stop-and-wait, timeout 300 ms, retry 3×).
+//   ESP32 ACK mọi frame nhận được (MSG_ACK 0x20). Coalesce = dedup only (đè
+//   frame cùng type chưa gửi). Frame > MTU−3 cắt qua _writeChunks — parser
+//   byte-stream ráp lại. WNR cho tất cả, app-level ACK đảm bảo độ tin cậy.
 //
 //   0x30 MAP_POSE  App→Dev  lat i32(deg×1e7), lng i32(deg×1e7),
 //                           heading u16(0.1°, 0..3599), speed u8(km/h),
@@ -44,7 +44,7 @@
 //   0x31 MAP_ROUTE App→Dev  header: anchor_lat i32, anchor_lng i32, seq u8,
 //                           frag_idx u8, frag_total u8, n u16; rồi n×{east
 //                           i16, north i16} (dm so với anchor, north-up).
-//                           Fragment nhiều frame cùng seq khi LEN > 200.
+//                           Fragment nhiều frame cùng seq khi vượt payload 1 BLE write.
 //   0x32 MAP_ROADS App→Dev  header: anchor_lat i32, anchor_lng i32, seq u8,
 //                           road_count u8; rồi mỗi road: class u8
 //                           (HighwayType.value), pt_count u8, pt_count×{east
@@ -129,7 +129,11 @@ class BleMapSnapshot {
 
 // ── Mã message ─────────────────────────────────────────────────────────
 const int _kSof = 0xA5;
-const int _kMaxPayload = 200;
+const int _kMaxPayload = 500;
+const int _kFrameOverhead = 6; // SOF + TYPE + LEN16 + CRC16
+const int _kPreferredMtu = 500;
+const int _kPreferredWriteMax = _kPreferredMtu - 3; // ATT header = 3 bytes
+const int _kMaxSingleWritePayload = _kPreferredWriteMax - _kFrameOverhead;
 
 const int _typeHello = 0x01;
 const int _typeDeviceInfo = 0x02;
@@ -164,15 +168,18 @@ const int _kMapMaxRoads =
 const int _kMapMaxRoadPts =
     30; // 40→30: ít pts hơn nhưng đổi lấy 33% road nhiều hơn
 
-// Payload tối đa mỗi MAP_ROADS frame — dùng hết MTU (200B) để gom nhiều
-// road/frame hơn, giảm số WR frames cần gửi (MTU 247 → frame 205B ≤ ATT max).
-const int _kMapRoadsMaxPayload = 200;
+// Payload tối đa mỗi MAP_ROADS frame để full frame vừa một ATT write khi MTU=500.
+const int _kMapRoadsMaxPayload = _kMaxSingleWritePayload;
 
 // Epsilon Douglas–Peucker (mét) — đơn giản hoá hình học route.
 const double _kSimplifyEpsM = 2.5;
 
 const int _protoVer = 1;
 const List<int> _kReconnectBackoffSec = [3, 6, 12, 24, 30];
+
+// Stop-and-wait ACK: timeout mỗi frame, số lần retry tối đa trước khi drop.
+const Duration _kAckTimeout = Duration(milliseconds: 300);
+const int _kAckMaxRetries = 3;
 
 /// Sự kiện nút bấm vật lý trên HUD (BTN_EVENT 0x21) → app xử lý (mute/repeat…).
 class ButtonEvent {
@@ -209,7 +216,7 @@ class BleBridge {
   StreamSubscription<Uint8List>? _incomingSub;
   StreamSubscription<BleConnectionState>? _connSub;
 
-  // ── Tx queue + coalescing (§5.3) ─────────────────────────────────────
+  // ── Tx queue — dedup + ACK-gated drain (§5.3) ────────────────────────
   final List<_TxItem> _queue = [];
   bool _sending = false;
 
@@ -222,6 +229,10 @@ class BleBridge {
   bool _intentionalDisconnect = false;
   bool _connectInFlight = false;
   DateTime? _connectedAt;
+
+  // ── ACK-gated send state ─────────────────────────────────────────────
+  Completer<void>? _ackCompleter;
+  int _ackExpectedType = 0;
 
   // ── Snapshot để resend sau reconnect (§5.3) ──────────────────────────
   int _instructionSeq = 0;
@@ -784,7 +795,7 @@ class BleBridge {
     }
   }
 
-  /// MAP_ROUTE (0x31) → fragment nhiều frame cùng [seq] khi LEN > 200.
+  /// MAP_ROUTE (0x31) → fragment nhiều frame cùng [seq] khi vượt payload 1 write.
   /// Mỗi frame: header (anchor_lat i32, anchor_lng i32, seq u8, frag_idx u8,
   /// frag_total u8, n u16 = 13 byte) + n×{east i16, north i16}.
   List<Uint8List> _encodeMapRoute(
@@ -799,7 +810,7 @@ class BleBridge {
     }
 
     const headerLen = 4 + 4 + 1 + 1 + 1 + 2; // 13 byte
-    final maxPtsPerFrame = (_kMaxPayload - headerLen) ~/ 4; // 4 byte/điểm
+    final maxPtsPerFrame = (_kMaxSingleWritePayload - headerLen) ~/ 4;
 
     // Chia điểm thành các mảnh; tối thiểu 1 mảnh (kể cả khi rỗng).
     final chunks = <List<({int e, int n})>>[];
@@ -893,7 +904,7 @@ class BleBridge {
     );
 
     const headerLen = 4 + 4 + 1 + 1; // 10 byte
-    final maxBody = _kMapRoadsMaxPayload - headerLen; // 140B — tránh HCI error
+    final maxBody = _kMapRoadsMaxPayload - headerLen;
 
     // Gom road vào frame; mỗi road = 2 + pts*4 byte. Road không vừa 1 frame
     // (hiếm) thì cắt bớt điểm.
@@ -940,21 +951,22 @@ class BleBridge {
 
   // ── Frame codec (pure, unit-testable) ────────────────────────────────
 
-  /// Dựng 1 frame hoàn chỉnh: SOF | TYPE | LEN | PAYLOAD | CRC16(LE).
-  /// CRC tính trên TYPE + LEN + PAYLOAD. Payload bị cắt nếu > 200.
+  /// Dựng 1 frame hoàn chỉnh: SOF | TYPE | LEN16 | PAYLOAD | CRC16(LE).
+  /// CRC tính trên TYPE + LEN16 + PAYLOAD. Payload bị cắt nếu > 500.
   Uint8List _frame(int type, List<int> payload) {
     final len = math.min(payload.length, _kMaxPayload);
-    final out = Uint8List(1 + 1 + 1 + len + 2);
+    final out = Uint8List(_kFrameOverhead + len);
     out[0] = _kSof;
     out[1] = type & 0xFF;
-    out[2] = len;
+    out[2] = len & 0xFF;
+    out[3] = (len >> 8) & 0xFF;
     for (var i = 0; i < len; i++) {
-      out[3 + i] = payload[i] & 0xFF;
+      out[4 + i] = payload[i] & 0xFF;
     }
-    // CRC trên TYPE+LEN+PAYLOAD = bytes [1 .. 3+len).
-    final crc = crc16Mcrf4xx(out, 1, 3 + len);
-    out[3 + len] = crc & 0xFF;
-    out[3 + len + 1] = (crc >> 8) & 0xFF;
+    // CRC trên TYPE+LEN16+PAYLOAD = bytes [1 .. 4+len).
+    final crc = crc16Mcrf4xx(out, 1, 4 + len);
+    out[4 + len] = crc & 0xFF;
+    out[4 + len + 1] = (crc >> 8) & 0xFF;
     return out;
   }
 
@@ -996,19 +1008,78 @@ class BleBridge {
       while (_queue.isNotEmpty &&
           _status.state == BleConnectionState.connected) {
         final item = _queue.removeAt(0);
-        try {
-          await _transport.write(item.frame, withResponse: item.withResponse);
-        } catch (_) {
-          // Lỗi write → coi như rớt kết nối; deframer/connState xử lý reconnect.
-          break;
+        final maxWriteLen = _maxWriteLen;
+
+        // Stop-and-wait: gửi frame, đợi MSG_ACK, retry khi timeout.
+        var acked = false;
+        for (var attempt = 0; attempt <= _kAckMaxRetries; attempt++) {
+          if (_status.state != BleConnectionState.connected) break;
+
+          final completer = Completer<void>();
+          _ackCompleter = completer;
+          _ackExpectedType = item.type;
+
+          try {
+            if (item.frame.length > maxWriteLen) {
+              await _writeChunks(item.frame, maxWriteLen: maxWriteLen);
+            } else {
+              await _transport.write(item.frame, withResponse: false);
+            }
+          } catch (_) {
+            _ackCompleter = null;
+            break; // Lỗi write → thoát; connState xử lý reconnect.
+          }
+
+          bool ok;
+          try {
+            await completer.future.timeout(_kAckTimeout);
+            ok = true;
+          } catch (_) {
+            ok = false;
+          }
+          if (identical(_ackCompleter, completer)) _ackCompleter = null;
+
+          if (ok) {
+            acked = true;
+            break;
+          }
+          if (attempt < _kAckMaxRetries) {
+            debugPrint(
+              '[BleBridge] ACK timeout type=0x${item.type.toRadixString(16)}'
+              ' attempt=${attempt + 1}/$_kAckMaxRetries, retry…',
+            );
+          }
+        }
+
+        if (!acked) {
+          debugPrint(
+            '[BleBridge] no ACK after $_kAckMaxRetries retries'
+            ' type=0x${item.type.toRadixString(16)} → drop',
+          );
         }
       }
     } finally {
+      _ackCompleter = null;
       _sending = false;
     }
   }
 
   // ── RX deframer (byte-stream state machine) — §6.1 ───────────────────
+
+  int get _maxWriteLen => math.max(20, _transport.mtu - 3);
+
+  Future<void> _writeChunks(
+    Uint8List data, {
+    required int maxWriteLen,
+  }) async {
+    for (var offset = 0; offset < data.length; offset += maxWriteLen) {
+      final end = math.min(offset + maxWriteLen, data.length);
+      await _transport.write(
+        Uint8List.sublistView(data, offset, end),
+        withResponse: false,
+      );
+    }
+  }
 
   final _Deframer _deframer = _Deframer();
 
@@ -1034,8 +1105,14 @@ class BleBridge {
       case _typeDeviceInfo:
         _handleDeviceInfo(payload);
       case _typeAck:
-        // acked_type u8, seq u8 — hiện chỉ phục vụ reliability nâng cao.
-        break;
+        if (payload.length >= 2) {
+          final ackedType = payload[0];
+          final c = _ackCompleter;
+          if (c != null && !c.isCompleted && ackedType == _ackExpectedType) {
+            _ackCompleter = null;
+            c.complete();
+          }
+        }
       case _typeBtnEvent:
         if (payload.length >= 2) {
           final btn = payload[0];
@@ -1140,6 +1217,12 @@ class BleBridge {
     _stopHeartbeat();
     _stopClockSync();
     _queue.clear();
+    // Giải phóng bất kỳ ACK đang chờ để _drain không bị treo.
+    final pendingAck = _ackCompleter;
+    if (pendingAck != null && !pendingAck.isCompleted) {
+      pendingAck.completeError(Exception('disconnected'));
+    }
+    _ackCompleter = null;
     _setStatus(_status.copyWith(state: BleConnectionState.disconnected));
     if (_intentionalDisconnect || !autoReconnect || _status.device == null) {
       return;
@@ -1249,7 +1332,7 @@ class _TxItem {
 class _Deframer {
   static const int _sof = _kSof;
 
-  int _state = 0; // 0 wait SOF, 1 type, 2 len, 3 payload, 4 crc-lo, 5 crc-hi
+  int _state = 0; // 0 wait SOF, 1 type, 2 len-lo, 3 len-hi, 4 payload, 5/6 crc
   int _type = 0;
   int _len = 0;
   final List<int> _payload = [];
@@ -1269,19 +1352,22 @@ class _Deframer {
           _state = 2;
         case 2:
           _len = byte;
+          _state = 3;
+        case 3:
+          _len |= byte << 8;
           _payload.clear();
           if (_len > _kMaxPayload) {
             _reset(); // LEN bất hợp lệ → bỏ.
           } else {
-            _state = _len == 0 ? 4 : 3;
+            _state = _len == 0 ? 5 : 4;
           }
-        case 3:
-          _payload.add(byte);
-          if (_payload.length >= _len) _state = 4;
         case 4:
-          _crcLo = byte;
-          _state = 5;
+          _payload.add(byte);
+          if (_payload.length >= _len) _state = 5;
         case 5:
+          _crcLo = byte;
+          _state = 6;
+        case 6:
           final crcRx = _crcLo | (byte << 8);
           final calc = _computeCrc();
           if (crcRx == calc) {
@@ -1293,7 +1379,7 @@ class _Deframer {
   }
 
   int _computeCrc() {
-    final buf = <int>[_type, _len, ..._payload];
+    final buf = <int>[_type, _len & 0xFF, (_len >> 8) & 0xFF, ..._payload];
     return crc16Mcrf4xx(buf);
   }
 
