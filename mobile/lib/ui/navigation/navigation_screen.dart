@@ -531,7 +531,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
 
     debugPrint('[MapData] _trySendMapData: center=${center.lat.toStringAsFixed(5)},${center.lng.toStringAsFixed(5)} route=${route.geometry.length}pts progress=${snap.routeProgressM.round()}m');
 
-    // Ưu tiên Overpass (bán kính 1.5 km, đầy đủ hơn). Nếu Overpass trả rỗng
+    // Ưu tiên Overpass (bán kính 0.5 km, đầy đủ hơn). Nếu Overpass trả rỗng
     // (lỗi mạng / timeout), dùng vector tiles của MapLibre làm fallback (~450 m
     // viewport, không cần network thêm vì tiles đã được tải sẵn).
     List<RoadSegment> roads;

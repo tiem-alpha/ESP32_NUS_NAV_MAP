@@ -474,24 +474,38 @@ class BleBridge {
       return;
     }
 
-    // (1) Bỏ phần đã đi, (2) simplify, (3) clip cửa sổ quanh anchor.
+    // (1) Bỏ phần đã đi, (2) clip cửa sổ quanh anchor, (3) simplify.
+    // Thứ tự clip-trước-DP quan trọng: DP trên geometry dài có thể xoá hết
+    // điểm gần user (đường thẳng dài), rồi clip trả rỗng → route đơ.
+    // Clip trước đảm bảo luôn giữ điểm gần user; DP chỉ giản lược vùng hiển thị.
     final trimmed = _trimTravelled(routeGeometry, routeProgressM);
-    final simplified = _douglasPeucker(trimmed, _kSimplifyEpsM);
-    final clipped = _clipToWindow(simplified, anchor);
+    final clipped = _clipToWindow(trimmed, anchor);
+    final simplified = _douglasPeucker(clipped, _kSimplifyEpsM);
 
     debugPrint(
       '[BleBridge] sendMapData: anchor=${anchor.lat.toStringAsFixed(5)},${anchor.lng.toStringAsFixed(5)}'
-      ' route: raw=${routeGeometry.length}→trimmed=${trimmed.length}→dp=${simplified.length}→clip=${clipped.length}'
+      ' route: raw=${routeGeometry.length}→trimmed=${trimmed.length}→clip=${clipped.length}→dp=${simplified.length}'
       ' roads_in=${roads.length}',
     );
 
-    // Cập nhật snapshot hình học — route chính xác với ESP32 (đã DP + clip).
+    // Giữ roads cũ khi Overpass lỗi mạng (lỗi tạm thời bên ngoài) — re-encode
+    // với anchor mới vẫn đúng vì GeoPoint là tọa độ tuyệt đối.
+    // Route KHÔNG fallback: clipped rỗng nghĩa là route ngoài cửa sổ 1200m —
+    // đây là trạng thái hợp lệ, không phải lỗi; gửi rỗng để ESP32 không vẽ.
     final prev = _mapSnapshot;
+    final effectiveRoads = roads.isNotEmpty ? roads : (prev?.roads ?? const []);
+
+    if (roads.isEmpty && (prev?.roads.isNotEmpty ?? false)) {
+      debugPrint(
+        '[BleBridge] sendMapData: roads empty (Overpass failure?) — keeping ${effectiveRoads.length} previous roads',
+      );
+    }
+
     if (prev != null) {
       _mapSnapshot = prev.copyWith(
         anchor: anchor,
-        route: clipped,
-        roads: roads,
+        route: simplified,
+        roads: effectiveRoads,
       );
       if (!_mapCtrl.isClosed) _mapCtrl.add(_mapSnapshot!);
     } else {
@@ -504,16 +518,16 @@ class BleBridge {
     // ESP32 (route/roads không bao giờ hiện); Write-No-Response không đảm
     // bảo gửi tới khi burst nhiều frame liên tiếp như khi fragment route dài.
     _routeSeq = (_routeSeq + 1) & 0xFF;
-    final routeFrames = _encodeMapRoute(clipped, anchor, _routeSeq);
+    final routeFrames = _encodeMapRoute(simplified, anchor, _routeSeq);
     debugPrint(
-      '[BleBridge] MAP_ROUTE seq=$_routeSeq → ${routeFrames.length} frames (${clipped.length} pts)',
+      '[BleBridge] MAP_ROUTE seq=$_routeSeq → ${routeFrames.length} frames (${simplified.length} pts)',
     );
     for (final frame in routeFrames) {
       _enqueueFrame(frame, _typeMapRoute, withResponse: true, coalesce: false);
     }
 
     _roadsSeq = (_roadsSeq + 1) & 0xFF;
-    final roadsFrames = _encodeMapRoads(roads, anchor, _roadsSeq);
+    final roadsFrames = _encodeMapRoads(effectiveRoads, anchor, _roadsSeq);
     debugPrint(
       '[BleBridge] MAP_ROADS seq=$_roadsSeq → ${roadsFrames.length} frames',
     );
