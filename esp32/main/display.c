@@ -547,7 +547,7 @@ static esp_lcd_panel_io_handle_t panel_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
     /* ST7789 thường cần đảo màu để hiển thị đúng. */
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, false));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     return io;

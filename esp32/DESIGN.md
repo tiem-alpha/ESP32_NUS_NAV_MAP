@@ -23,7 +23,7 @@ ESP32 = **HUD hiển thị**, là **Peripheral** advertise Nordic UART Service (
 
 | Mục đích | Công nghệ |
 |----------|-----------|
-| Chip | **ESP32-H2** (RISC-V single-core, BLE-only, **KHÔNG có PSRAM**, ~256KB SRAM sau Bluedroid) |
+| Chip | **ESP32-H2** (RISC-V single-core, BLE-only, **KHÔNG có PSRAM**, ~256KB SRAM trước Bluedroid) |
 | Framework | ESP-IDF v5.x |
 | BLE stack | Bluedroid GATT server (NUS) — đã có tại `main/nus.c` |
 | GUI | **LVGL v8.3** (managed component `lvgl/lvgl`), color depth 16, `LV_COLOR_16_SWAP=1` |

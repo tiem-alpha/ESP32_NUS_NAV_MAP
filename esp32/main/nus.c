@@ -63,6 +63,7 @@ typedef struct {
     bool adv_data_ready;
     bool adv_start_requested;
     bool adv_timed_out;
+    bool service_ready;
     bool congested;
     uint32_t adv_timeout_ms;
     esp_gatt_if_t gatts_if;
@@ -307,6 +308,10 @@ static void nus_on_adv_data_ready(void)
     }
 
     s_nus.adv_data_ready = true;
+    if (!s_nus.service_ready) {
+        ESP_LOGI(NUS_TAG, "Advertising deferred until NUS service is ready");
+        return;
+    }
     if (s_nus.config.auto_start_adv || s_nus.adv_start_requested) {
         uint32_t timeout_ms = s_nus.adv_start_requested ? s_nus.adv_timeout_ms : s_nus.config.adv_timeout_ms;
         esp_err_t err = nus_start_adv(timeout_ms);
@@ -700,7 +705,6 @@ static void nus_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t ga
         ESP_LOGI(NUS_TAG, "Service create, status %d, service_handle %d",
                  param->create.status, param->create.service_handle);
         s_nus.service_handle = param->create.service_handle;
-        esp_ble_gatts_start_service(s_nus.service_handle);
 
         s_char_uuid.len = ESP_UUID_LEN_128;
         memcpy(s_char_uuid.uuid.uuid128, s_nus_rx_char_uuid128, sizeof(s_nus_rx_char_uuid128));
@@ -755,11 +759,29 @@ static void nus_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t ga
                  param->add_char_descr.status,
                  param->add_char_descr.attr_handle,
                  param->add_char_descr.service_handle);
+        if (param->add_char_descr.status == ESP_GATT_OK) {
+            esp_ble_gatts_start_service(s_nus.service_handle);
+        }
         break;
 
     case ESP_GATTS_START_EVT:
         ESP_LOGI(NUS_TAG, "Service start, status %d, service_handle %d",
                  param->start.status, param->start.service_handle);
+        if (param->start.status == ESP_GATT_OK) {
+            s_nus.service_ready = true;
+            ESP_LOGI(NUS_TAG, "NUS ready: service %d, rx %d, tx %d, cccd %d",
+                     s_nus.service_handle,
+                     s_nus.rx_char_handle,
+                     s_nus.tx_char_handle,
+                     s_nus.tx_cccd_handle);
+            if (s_nus.config.auto_start_adv || s_nus.adv_start_requested) {
+                uint32_t timeout_ms = s_nus.adv_start_requested ? s_nus.adv_timeout_ms : s_nus.config.adv_timeout_ms;
+                esp_err_t err = nus_start_adv(timeout_ms);
+                if (err != ESP_OK) {
+                    ESP_LOGE(NUS_TAG, "Start advertising failed: %s", esp_err_to_name(err));
+                }
+            }
+        }
         break;
 
     case ESP_GATTS_CONNECT_EVT: {
@@ -1043,7 +1065,7 @@ esp_err_t nus_start_adv(uint32_t timeout_ms)
     s_nus.adv_timeout_ms = timeout_ms;
     s_nus.adv_start_requested = true;
 
-    if (!s_nus.adv_data_ready) {
+    if (!s_nus.adv_data_ready || !s_nus.service_ready) {
         return ESP_OK;
     }
 

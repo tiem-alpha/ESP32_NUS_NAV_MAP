@@ -16,7 +16,6 @@
 
 #include "clock_model.h"
 #include "display.h"
-#include "map_cache.h"
 #include "map_model.h"
 #include "nav_model.h"
 #include "nus.h"
@@ -65,15 +64,6 @@ void app_main(void)
 
     /* Display + LVGL trước để báo trạng thái sớm. */
     display_init();
-
-    /* SPIFFS + khôi phục geom map từ cache (nếu có). */
-    if (map_cache_init() == ESP_OK) {
-        static map_geom_t cached; /* tránh stack lớn */
-        if (map_cache_load(&cached) == ESP_OK) {
-            map_model_set_geom(&cached);
-            ESP_LOGI(APP_TAG, "Restored map geom from cache");
-        }
-    }
 
     /* Protocol + feature models. */
     ESP_ERROR_CHECK(nus_protocol_init(app_proto_tx, true /* auto_ack */));
