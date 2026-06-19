@@ -113,19 +113,18 @@ class BleMapSnapshot {
     GeoPoint? anchor,
     List<GeoPoint>? route,
     List<RoadSegment>? roads,
-  }) =>
-      BleMapSnapshot(
-        user: user ?? this.user,
-        headingDeg: headingDeg ?? this.headingDeg,
-        speedKmh: speedKmh ?? this.speedKmh,
-        navigating: navigating ?? this.navigating,
-        offRoute: offRoute ?? this.offRoute,
-        gpsFix: gpsFix ?? this.gpsFix,
-        viewSpanM: viewSpanM ?? this.viewSpanM,
-        anchor: anchor ?? this.anchor,
-        route: route ?? this.route,
-        roads: roads ?? this.roads,
-      );
+  }) => BleMapSnapshot(
+    user: user ?? this.user,
+    headingDeg: headingDeg ?? this.headingDeg,
+    speedKmh: speedKmh ?? this.speedKmh,
+    navigating: navigating ?? this.navigating,
+    offRoute: offRoute ?? this.offRoute,
+    gpsFix: gpsFix ?? this.gpsFix,
+    viewSpanM: viewSpanM ?? this.viewSpanM,
+    anchor: anchor ?? this.anchor,
+    route: route ?? this.route,
+    roads: roads ?? this.roads,
+  );
 }
 
 // ── Mã message ─────────────────────────────────────────────────────────
@@ -157,11 +156,13 @@ const double _kRouteLeadInM = 50.0;
 
 // Khớp MAP_MAX_ROADS phía firmware (map_model.h) — road vượt ngưỡng này bị
 // firmware âm thầm bỏ theo thứ tự đến, nên phải tự cắt + ưu tiên ở mobile.
-const int _kMapMaxRoads = 64; // khớp MAP_MAX_ROADS firmware; RAM giống cũ (64×122B ≈ 48×162B)
+const int _kMapMaxRoads =
+    64; // khớp MAP_MAX_ROADS firmware; RAM giống cũ (64×122B ≈ 48×162B)
 
 // Số điểm tối đa mỗi road gửi xuống — khớp MAP_MAX_ROAD_PTS firmware. Gửi
 // nhiều hơn chỉ lãng phí băng thông vì firmware sẽ bỏ phần thừa.
-const int _kMapMaxRoadPts = 30; // 40→30: ít pts hơn nhưng đổi lấy 33% road nhiều hơn
+const int _kMapMaxRoadPts =
+    30; // 40→30: ít pts hơn nhưng đổi lấy 33% road nhiều hơn
 
 // Payload tối đa mỗi MAP_ROADS frame — dùng hết MTU (200B) để gom nhiều
 // road/frame hơn, giảm số WR frames cần gửi (MTU 247 → frame 205B ≤ ATT max).
@@ -171,6 +172,7 @@ const int _kMapRoadsMaxPayload = 200;
 const double _kSimplifyEpsM = 2.5;
 
 const int _protoVer = 1;
+const List<int> _kReconnectBackoffSec = [3, 6, 12, 24, 30];
 
 /// Sự kiện nút bấm vật lý trên HUD (BTN_EVENT 0x21) → app xử lý (mute/repeat…).
 class ButtonEvent {
@@ -218,6 +220,8 @@ class BleBridge {
   int _reconnectAttempt = 0;
   bool _disposed = false;
   bool _intentionalDisconnect = false;
+  bool _connectInFlight = false;
+  DateTime? _connectedAt;
 
   // ── Snapshot để resend sau reconnect (§5.3) ──────────────────────────
   int _instructionSeq = 0;
@@ -258,48 +262,70 @@ class BleBridge {
   Stream<BleMapSnapshot> get mapSnapshots => _mapCtrl.stream;
 
   Future<void> connectTo(DiscoveredDevice device) async {
-    _intentionalDisconnect = false;
-    _cancelReconnect();
-    _setStatus(
-      _status.copyWith(
-        state: BleConnectionState.connecting,
-        device: device,
-        reconnectInSeconds: 0,
-      ),
-    );
-
-    try {
-      _listenIncoming();
-      _listenConnState();
-      await _transport.connect(device.id);
-    } catch (_) {
-      _onConnectionLost();
+    if (_disposed) return;
+    if (_connectInFlight) {
+      debugPrint('[BleBridge] connect ignored: another attempt is in flight');
       return;
     }
+    _connectInFlight = true;
 
-    _setStatus(
-      _status.copyWith(
-        state: BleConnectionState.connected,
-        mtu: _transport.mtu,
-      ),
-    );
+    try {
+      _intentionalDisconnect = false;
+      _cancelReconnect();
+      _setStatus(
+        _status.copyWith(
+          state: BleConnectionState.connecting,
+          device: device,
+          reconnectInSeconds: 0,
+        ),
+      );
 
-    // Ưu tiên kết nối HIGH khi đang dùng (§5.2).
-    unawaited(_transport.setHighPriority(true));
+      try {
+        _listenIncoming();
+        _listenConnState();
+        await _transport.connect(device.id);
+      } catch (e, st) {
+        debugPrint('[BleBridge] connect FAILED: $e\n$st');
+        try {
+          await _transport.disconnect();
+        } catch (_) {}
+        _onConnectionLost();
+        return;
+      }
 
-    // Handshake: gửi HELLO, chờ DEVICE_INFO (dispatch sẽ cập nhật status.info).
-    _enqueue(_typeHello, [_protoVer], withResponse: true, coalesce: false);
+      if (_intentionalDisconnect || _disposed) {
+        await _transport.disconnect();
+        return;
+      }
 
-    _startHeartbeat();
-    _startClockSync();
-    unawaited(_refreshRssi());
+      _connectedAt = DateTime.now();
+      _setStatus(
+        _status.copyWith(
+          state: BleConnectionState.connected,
+          mtu: _transport.mtu,
+        ),
+      );
 
-    // Nối lại → bắn full snapshot để HUD đồng bộ ngay (§5.3).
-    _resendSnapshot();
+      // Ưu tiên kết nối HIGH khi đang dùng (§5.2).
+      unawaited(_transport.setHighPriority(true));
+
+      // Handshake: gửi HELLO, chờ DEVICE_INFO (dispatch sẽ cập nhật status.info).
+      _enqueue(_typeHello, [_protoVer], withResponse: true, coalesce: false);
+
+      _startHeartbeat();
+      _startClockSync();
+      unawaited(_refreshRssi());
+
+      // Nối lại → bắn full snapshot để HUD đồng bộ ngay (§5.3).
+      _resendSnapshot();
+    } finally {
+      _connectInFlight = false;
+    }
   }
 
   void disconnect() {
     _intentionalDisconnect = true;
+    _connectedAt = null;
     _cancelReconnect();
     _stopHeartbeat();
     _stopClockSync();
@@ -390,7 +416,9 @@ class BleBridge {
             viewSpanM: viewSpanM,
           );
     if (prev == null) {
-      debugPrint('[BleBridge] MAP_POSE first send: ${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)} heading=${bearing.round()} viewSpan=${viewSpanM.round()}m');
+      debugPrint(
+        '[BleBridge] MAP_POSE first send: ${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)} heading=${bearing.round()} viewSpan=${viewSpanM.round()}m',
+      );
     }
     if (!_mapCtrl.isClosed) _mapCtrl.add(_mapSnapshot!);
   }
@@ -414,10 +442,12 @@ class BleBridge {
     required List<RoadSegment> roads,
     required double routeProgressM,
   }) async {
-    final anchor = _lastPose ??
-        (routeGeometry.isNotEmpty ? routeGeometry.first : null);
+    final anchor =
+        _lastPose ?? (routeGeometry.isNotEmpty ? routeGeometry.first : null);
     if (anchor == null) {
-      debugPrint('[BleBridge] sendMapData: anchor=null (lastPose=$_lastPose, routeLen=${routeGeometry.length}) → abort');
+      debugPrint(
+        '[BleBridge] sendMapData: anchor=null (lastPose=$_lastPose, routeLen=${routeGeometry.length}) → abort',
+      );
       return;
     }
 
@@ -426,17 +456,25 @@ class BleBridge {
     final simplified = _douglasPeucker(trimmed, _kSimplifyEpsM);
     final clipped = _clipToWindow(simplified, anchor);
 
-    debugPrint('[BleBridge] sendMapData: anchor=${anchor.lat.toStringAsFixed(5)},${anchor.lng.toStringAsFixed(5)}'
-        ' route: raw=${routeGeometry.length}→trimmed=${trimmed.length}→dp=${simplified.length}→clip=${clipped.length}'
-        ' roads_in=${roads.length}');
+    debugPrint(
+      '[BleBridge] sendMapData: anchor=${anchor.lat.toStringAsFixed(5)},${anchor.lng.toStringAsFixed(5)}'
+      ' route: raw=${routeGeometry.length}→trimmed=${trimmed.length}→dp=${simplified.length}→clip=${clipped.length}'
+      ' roads_in=${roads.length}',
+    );
 
     // Cập nhật snapshot hình học — route chính xác với ESP32 (đã DP + clip).
     final prev = _mapSnapshot;
     if (prev != null) {
-      _mapSnapshot = prev.copyWith(anchor: anchor, route: clipped, roads: roads);
+      _mapSnapshot = prev.copyWith(
+        anchor: anchor,
+        route: clipped,
+        roads: roads,
+      );
       if (!_mapCtrl.isClosed) _mapCtrl.add(_mapSnapshot!);
     } else {
-      debugPrint('[BleBridge] sendMapData: _mapSnapshot=null, snapshot NOT updated (no MAP_POSE sent yet?)');
+      debugPrint(
+        '[BleBridge] sendMapData: _mapSnapshot=null, snapshot NOT updated (no MAP_POSE sent yet?)',
+      );
     }
 
     // withResponse: true — một fragment rớt là hỏng cả lần reassembly trên
@@ -444,14 +482,18 @@ class BleBridge {
     // bảo gửi tới khi burst nhiều frame liên tiếp như khi fragment route dài.
     _routeSeq = (_routeSeq + 1) & 0xFF;
     final routeFrames = _encodeMapRoute(clipped, anchor, _routeSeq);
-    debugPrint('[BleBridge] MAP_ROUTE seq=$_routeSeq → ${routeFrames.length} frames (${clipped.length} pts)');
+    debugPrint(
+      '[BleBridge] MAP_ROUTE seq=$_routeSeq → ${routeFrames.length} frames (${clipped.length} pts)',
+    );
     for (final frame in routeFrames) {
       _enqueueFrame(frame, _typeMapRoute, withResponse: true, coalesce: false);
     }
 
     _roadsSeq = (_roadsSeq + 1) & 0xFF;
     final roadsFrames = _encodeMapRoads(roads, anchor, _roadsSeq);
-    debugPrint('[BleBridge] MAP_ROADS seq=$_roadsSeq → ${roadsFrames.length} frames');
+    debugPrint(
+      '[BleBridge] MAP_ROADS seq=$_roadsSeq → ${roadsFrames.length} frames',
+    );
     for (final frame in roadsFrames) {
       _enqueueFrame(frame, _typeMapRoads, withResponse: true, coalesce: false);
     }
@@ -518,8 +560,8 @@ class BleBridge {
 
       case PhaseChanged():
         // Cập nhật cờ điều hướng cho MAP_POSE.flags.
-        _navigating = e.phase == NavPhase.navigating ||
-            e.phase == NavPhase.rerouting;
+        _navigating =
+            e.phase == NavPhase.navigating || e.phase == NavPhase.rerouting;
         _offRoute = e.phase == NavPhase.rerouting;
         final frame = _frame(_typeNavState, [_navStateWire(e.phase.wire)]);
         _lastNavStateFrame = frame;
@@ -676,7 +718,8 @@ class BleBridge {
     ];
     final out = <GeoPoint>[];
     for (var i = 0; i < geometry.length; i++) {
-      final keep = inside[i] ||
+      final keep =
+          inside[i] ||
           (i > 0 && inside[i - 1]) ||
           (i < geometry.length - 1 && inside[i + 1]);
       if (keep) out.add(geometry[i]);
@@ -703,8 +746,13 @@ class BleBridge {
     return out;
   }
 
-  void _dpRecurse(List<({double east, double north})> xy, int lo, int hi,
-      double epsM, List<bool> keep) {
+  void _dpRecurse(
+    List<({double east, double north})> xy,
+    int lo,
+    int hi,
+    double epsM,
+    List<bool> keep,
+  ) {
     if (hi <= lo + 1) return;
     final ax = xy[lo].east, ay = xy[lo].north;
     final bx = xy[hi].east, by = xy[hi].north;
@@ -740,7 +788,10 @@ class BleBridge {
   /// Mỗi frame: header (anchor_lat i32, anchor_lng i32, seq u8, frag_idx u8,
   /// frag_total u8, n u16 = 13 byte) + n×{east i16, north i16}.
   List<Uint8List> _encodeMapRoute(
-      List<GeoPoint> geometry, GeoPoint anchor, int seq) {
+    List<GeoPoint> geometry,
+    GeoPoint anchor,
+    int seq,
+  ) {
     final pts = <({int e, int n})>[];
     for (final p in geometry) {
       final m = _toMeters(p, anchor);
@@ -788,7 +839,10 @@ class BleBridge {
   /// MAP_MAX_ROADS theo thứ tự đến nên road lân cận giao cắt (thường là
   /// đường nhỏ) không được xếp đầu sẽ bị rớt nếu chỉ sort theo class.
   List<Uint8List> _encodeMapRoads(
-      List<RoadSegment> roads, GeoPoint anchor, int seq) {
+    List<RoadSegment> roads,
+    GeoPoint anchor,
+    int seq,
+  ) {
     // Lượng tử hoá từng road; bỏ road có MỌI điểm ngoài cửa sổ ~1.2 km.
     final encoded = <({int cls, double dist, List<({int e, int n})> pts})>[];
     for (final road in roads) {
@@ -811,7 +865,9 @@ class BleBridge {
       // Vẫn gửi 1 frame road_count=0 để ESP32 chốt anchor mới và clear roads.
       // Nếu không gửi, ESP32 giữ road_n cũ với anchor cũ → roads hiển thị sai
       // vị trí sau khi MAP_ROUTE đến với anchor mới.
-      debugPrint('[MapRoads] _encodeMapRoads: all ${roads.length} roads outside window → send clear frame');
+      debugPrint(
+        '[MapRoads] _encodeMapRoads: all ${roads.length} roads outside window → send clear frame',
+      );
       final b = BytesBuilder();
       _putI32(b, (anchor.lat * 1e7).round());
       _putI32(b, (anchor.lng * 1e7).round());
@@ -831,8 +887,10 @@ class BleBridge {
     final budgeted = encoded.length > _kMapMaxRoads
         ? encoded.sublist(0, _kMapMaxRoads)
         : encoded;
-    debugPrint('[MapRoads] _encodeMapRoads: in=${roads.length} outside=$skippedOutside valid=${encoded.length} budgeted=${budgeted.length}/$_kMapMaxRoads'
-        ' (window=${_kMapWindowM.round()}m, maxPts=$_kMapMaxRoadPts)');
+    debugPrint(
+      '[MapRoads] _encodeMapRoads: in=${roads.length} outside=$skippedOutside valid=${encoded.length} budgeted=${budgeted.length}/$_kMapMaxRoads'
+      ' (window=${_kMapWindowM.round()}m, maxPts=$_kMapMaxRoadPts)',
+    );
 
     const headerLen = 4 + 4 + 1 + 1; // 10 byte
     final maxBody = _kMapRoadsMaxPayload - headerLen; // 140B — tránh HCI error
@@ -908,8 +966,12 @@ class BleBridge {
     bool withResponse = false,
     bool coalesce = false,
   }) {
-    _enqueueFrame(_frame(type, payload), type,
-        withResponse: withResponse, coalesce: coalesce);
+    _enqueueFrame(
+      _frame(type, payload),
+      type,
+      withResponse: withResponse,
+      coalesce: coalesce,
+    );
   }
 
   void _enqueueFrame(
@@ -1042,7 +1104,10 @@ class BleBridge {
   void _startClockSync() {
     _stopClockSync();
     _sendClock();
-    _clockSync = Timer.periodic(const Duration(seconds: 30), (_) => _sendClock());
+    _clockSync = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _sendClock(),
+    );
   }
 
   void _stopClockSync() {
@@ -1061,6 +1126,17 @@ class BleBridge {
   // ── Reconnect backoff 1/2/4/8 s (§5.3) ───────────────────────────────
 
   void _onConnectionLost() {
+    final connectedFor = _connectedAt == null
+        ? null
+        : DateTime.now().difference(_connectedAt!);
+    if (connectedFor != null && connectedFor >= const Duration(seconds: 5)) {
+      _reconnectAttempt = 0;
+    }
+    debugPrint(
+      '[BleBridge] _onConnectionLost — intentional=$_intentionalDisconnect '
+      'autoReconnect=$autoReconnect connectedFor=${connectedFor?.inMilliseconds}ms',
+    );
+    _connectedAt = null;
     _stopHeartbeat();
     _stopClockSync();
     _queue.clear();
@@ -1073,17 +1149,24 @@ class BleBridge {
 
   void _scheduleReconnect() {
     _cancelReconnect();
-    final delaySec = [1, 2, 4, 8][math.min(_reconnectAttempt, 3)];
+    final delaySec =
+        _kReconnectBackoffSec[math.min(
+          _reconnectAttempt,
+          _kReconnectBackoffSec.length - 1,
+        )];
     _reconnectAttempt++;
     _setStatus(_status.copyWith(reconnectInSeconds: delaySec));
+    debugPrint('[BleBridge] reconnect scheduled in ${delaySec}s');
     _reconnect = Timer(Duration(seconds: delaySec), () {
       final device = _status.device;
       if (device == null || _intentionalDisconnect || !autoReconnect) return;
-      unawaited(connectTo(device).then((_) {
-        if (_status.state == BleConnectionState.connected) {
-          _reconnectAttempt = 0;
-        }
-      }));
+      unawaited(
+        connectTo(device).then((_) {
+          if (_status.state == BleConnectionState.connected) {
+            _reconnectAttempt = 0;
+          }
+        }),
+      );
     });
   }
 
@@ -1098,8 +1181,11 @@ class BleBridge {
       _enqueueFrame(_lastNavStateFrame!, _typeNavState, withResponse: true);
     }
     if (_lastInstructionFrame != null) {
-      _enqueueFrame(_lastInstructionFrame!, _typeNavInstruction,
-          withResponse: true);
+      _enqueueFrame(
+        _lastInstructionFrame!,
+        _typeNavInstruction,
+        withResponse: true,
+      );
     }
     if (_lastDistanceTickFrame != null) {
       _enqueueFrame(_lastDistanceTickFrame!, _typeDistanceTick);
@@ -1169,7 +1255,10 @@ class _Deframer {
   final List<int> _payload = [];
   int _crcLo = 0;
 
-  void feed(List<int> bytes, void Function(int type, Uint8List payload) onFrame) {
+  void feed(
+    List<int> bytes,
+    void Function(int type, Uint8List payload) onFrame,
+  ) {
     for (final raw in bytes) {
       final byte = raw & 0xFF;
       switch (_state) {
@@ -1220,17 +1309,71 @@ class _Deframer {
 /// Bảng bỏ dấu tiếng Việt (giống `geocoding_service.dart`), dùng để strip
 /// street_name khi thiết bị không hỗ trợ dấu / người dùng ép bỏ dấu.
 const Map<String, String> _vietnameseAscii = {
-  'à': 'a', 'á': 'a', 'ạ': 'a', 'ả': 'a', 'ã': 'a',
-  'â': 'a', 'ầ': 'a', 'ấ': 'a', 'ậ': 'a', 'ẩ': 'a', 'ẫ': 'a',
-  'ă': 'a', 'ằ': 'a', 'ắ': 'a', 'ặ': 'a', 'ẳ': 'a', 'ẵ': 'a',
-  'è': 'e', 'é': 'e', 'ẹ': 'e', 'ẻ': 'e', 'ẽ': 'e',
-  'ê': 'e', 'ề': 'e', 'ế': 'e', 'ệ': 'e', 'ể': 'e', 'ễ': 'e',
-  'ì': 'i', 'í': 'i', 'ị': 'i', 'ỉ': 'i', 'ĩ': 'i',
-  'ò': 'o', 'ó': 'o', 'ọ': 'o', 'ỏ': 'o', 'õ': 'o',
-  'ô': 'o', 'ồ': 'o', 'ố': 'o', 'ộ': 'o', 'ổ': 'o', 'ỗ': 'o',
-  'ơ': 'o', 'ờ': 'o', 'ớ': 'o', 'ợ': 'o', 'ở': 'o', 'ỡ': 'o',
-  'ù': 'u', 'ú': 'u', 'ụ': 'u', 'ủ': 'u', 'ũ': 'u',
-  'ư': 'u', 'ừ': 'u', 'ứ': 'u', 'ự': 'u', 'ử': 'u', 'ữ': 'u',
-  'ỳ': 'y', 'ý': 'y', 'ỵ': 'y', 'ỷ': 'y', 'ỹ': 'y',
+  'à': 'a',
+  'á': 'a',
+  'ạ': 'a',
+  'ả': 'a',
+  'ã': 'a',
+  'â': 'a',
+  'ầ': 'a',
+  'ấ': 'a',
+  'ậ': 'a',
+  'ẩ': 'a',
+  'ẫ': 'a',
+  'ă': 'a',
+  'ằ': 'a',
+  'ắ': 'a',
+  'ặ': 'a',
+  'ẳ': 'a',
+  'ẵ': 'a',
+  'è': 'e',
+  'é': 'e',
+  'ẹ': 'e',
+  'ẻ': 'e',
+  'ẽ': 'e',
+  'ê': 'e',
+  'ề': 'e',
+  'ế': 'e',
+  'ệ': 'e',
+  'ể': 'e',
+  'ễ': 'e',
+  'ì': 'i',
+  'í': 'i',
+  'ị': 'i',
+  'ỉ': 'i',
+  'ĩ': 'i',
+  'ò': 'o',
+  'ó': 'o',
+  'ọ': 'o',
+  'ỏ': 'o',
+  'õ': 'o',
+  'ô': 'o',
+  'ồ': 'o',
+  'ố': 'o',
+  'ộ': 'o',
+  'ổ': 'o',
+  'ỗ': 'o',
+  'ơ': 'o',
+  'ờ': 'o',
+  'ớ': 'o',
+  'ợ': 'o',
+  'ở': 'o',
+  'ỡ': 'o',
+  'ù': 'u',
+  'ú': 'u',
+  'ụ': 'u',
+  'ủ': 'u',
+  'ũ': 'u',
+  'ư': 'u',
+  'ừ': 'u',
+  'ứ': 'u',
+  'ự': 'u',
+  'ử': 'u',
+  'ữ': 'u',
+  'ỳ': 'y',
+  'ý': 'y',
+  'ỵ': 'y',
+  'ỷ': 'y',
+  'ỹ': 'y',
   'đ': 'd',
 };
