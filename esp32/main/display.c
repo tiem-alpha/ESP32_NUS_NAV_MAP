@@ -6,7 +6,7 @@
  *
  * Ràng buộc RAM (ESP32-H2, KHÔNG PSRAM, ~256KB): KHÔNG cấp full framebuffer
  * 240×320 (153KB). Dùng LVGL *partial draw buffer*: 2 dải 240×40 lv_color_t
- * (≈19KB/dải, DMA-capable internal RAM). LVGL render từng dải rồi flush ra panel.
+ * (≈19KB/dải, DMA-capable internal RAM). 8 dải/frame → ít tearing hơn 16 dải.
  *
  * Map vẽ bằng custom draw (LV_EVENT_DRAW_MAIN của 1 obj full-screen) qua
  * lv_draw_line — KHÔNG lv_canvas. Overlay = widget LVGL con nền bán trong suốt.
@@ -51,7 +51,7 @@ LV_FONT_DECLARE(lv_font_vi_12);
 /* ── Cấu hình panel / draw buffer ────────────────────────────────────── */
 #define LCD_H_RES        SCR_W   /* 240 */
 #define LCD_V_RES        SCR_H   /* 320 */
-#define LCD_DRAW_LINES   20      /* chiều cao 1 dải draw buffer (240×20) */
+#define LCD_DRAW_LINES   40      /* chiều cao 1 dải draw buffer (240×40) */
 #define LCD_CMD_BITS     8
 #define LCD_PARAM_BITS   8
 #define LVGL_TICK_MS     2
@@ -92,7 +92,12 @@ static lv_obj_t *s_clock_label  = NULL;  /* đồng hồ thực "07:42" */
 
 static bool s_connected     = false;  /* lưu state nếu UI chưa dựng */
 static bool s_ui_ready      = false;
-static map_geom_t s_render_geom;     /* BSS tĩnh: tránh giữ map mutex suốt 15ms vẽ */
+
+/* Snapshot chụp trước khi invalidate — dùng chung cho tất cả dải của 1 frame.
+ * Đảm bảo mọi strip render cùng 1 bộ dữ liệu, không bị đứt đoạn giữa frame. */
+static map_geom_t s_render_geom;
+static map_pose_t s_render_pose;
+static bool       s_render_ready = false;
 
 /* ── Mutex helpers ───────────────────────────────────────────────────── */
 static inline bool lvgl_lock(uint32_t timeout_ms)
@@ -208,26 +213,14 @@ static void map_draw_event_cb(lv_event_t *e)
         return;
     }
 
-    /* Chưa có pose → để nền đen (không vẽ gì). */
-    if (!map_model_has_pose()) {
+    /* Dùng snapshot đã chụp trong lvgl_task trước khi invalidate.
+     * Đảm bảo tất cả dải strip của 1 frame dùng cùng dữ liệu — không đứt đoạn. */
+    if (!s_render_ready) {
         return;
     }
 
-    map_pose_t pose;
-    map_model_get_pose(&pose);
-
-    /* Lock chỉ để copy geom (~8 KB, ~0.1 ms), thả ngay trước khi render.
-     * BLE task (map_swap_to_front ~8 KB copy) chỉ bị block tối đa 0.1 ms
-     * thay vì 10–15 ms nếu để mutex suốt lúc vẽ — tránh watchdog reset. */
-    {
-        const map_geom_t *g = map_model_lock_geom();
-        if (!g) return;
-        s_render_geom = *g;       /* copy dưới mutex */
-        map_model_unlock_geom();  /* thả mutex TRƯỚC khi render */
-    }
-
     proj_ctx_t proj;
-    projection_begin(&proj, &s_render_geom, &pose);
+    projection_begin(&proj, &s_render_geom, &s_render_pose);
 
     /* 1) Roads (xám, độ dày theo class). */
     lv_draw_line_dsc_t road_dsc;
@@ -475,14 +468,31 @@ static void lvgl_task(void *arg)
 
     for (;;) {
         if (lvgl_lock(0)) {
-            /* Cập nhật overlay mỗi vòng (rẻ). */
-            if (s_ui_ready) {
-                overlay_update();
-            }
-            /* Throttle invalidate map ~6–7 Hz để tiết kiệm CPU. */
             since_map_ms += LVGL_TASK_MS;
             if (s_ui_ready && since_map_ms >= MAP_REFRESH_MS) {
                 since_map_ms = 0;
+
+                /* Overlay + map trong cùng 1 chu kỳ → 1 lần redraw duy nhất,
+                 * tránh partial redraws lệch pha gây giật. */
+                overlay_update();
+
+                /* Chụp snapshot pose + geom TRƯỚC khi invalidate.
+                 * map_draw_event_cb (gọi 1 lần/dải) dùng lại snapshot này
+                 * → mọi strip thấy cùng dữ liệu, không đứt đoạn giữa frame. */
+                if (map_model_has_pose()) {
+                    map_model_get_pose(&s_render_pose);
+                    const map_geom_t *g = map_model_lock_geom();
+                    if (g) {
+                        s_render_geom  = *g;
+                        map_model_unlock_geom();
+                        s_render_ready = true;
+                    } else {
+                        s_render_ready = false;
+                    }
+                } else {
+                    s_render_ready = false;
+                }
+
                 lv_obj_invalidate(s_map_obj);
             }
             lv_timer_handler();
