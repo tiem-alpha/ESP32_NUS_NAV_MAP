@@ -661,8 +661,8 @@ static void nus_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t ga
     }
 
     case ESP_GATTS_WRITE_EVT:
-        ESP_LOGI(NUS_TAG, "Write request, conn_id %d, trans_id %" PRIu32 ", handle %d, len %d",
-                 param->write.conn_id, param->write.trans_id, param->write.handle, param->write.len);
+        // ESP_LOGI(NUS_TAG, "Write request, conn_id %d, trans_id %" PRIu32 ", handle %d, len %d",
+        //          param->write.conn_id, param->write.trans_id, param->write.handle, param->write.len);
 
         if (!param->write.is_prep) {
             if (param->write.handle == s_nus.rx_char_handle) {
@@ -843,13 +843,13 @@ static void nus_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t ga
     case ESP_GATTS_CONGEST_EVT:
         if (param->congest.conn_id == s_nus.conn_id) {
             s_nus.congested = param->congest.congested;
-            ESP_LOGI(NUS_TAG, "Congestion %s", s_nus.congested ? "on" : "off");
+            // ESP_LOGI(NUS_TAG, "Congestion %s", s_nus.congested ? "on" : "off");
         }
         break;
 
     case ESP_GATTS_CONF_EVT:
-        ESP_LOGI(NUS_TAG, "Confirm receive, status %d, attr_handle %d",
-                 param->conf.status, param->conf.handle);
+        // ESP_LOGI(NUS_TAG, "Confirm receive, status %d, attr_handle %d",
+        //          param->conf.status, param->conf.handle);
         if (param->conf.status != ESP_GATT_OK) {
             ESP_LOG_BUFFER_HEX(NUS_TAG, param->conf.value, param->conf.len);
         }

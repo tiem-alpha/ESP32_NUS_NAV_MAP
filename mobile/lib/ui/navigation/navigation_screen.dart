@@ -52,7 +52,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   GeoPoint? _lastMapPosSent;
   static const _mapPosMoveThresholdM = 5.0; // gửi MAP_POSE mỗi GPS tick (~1 Hz)
   GeoPoint? _lastMapDataCenter;
-  static const _mapDataResendThresholdM = 70.0;
+  static const _mapDataResendThresholdM = 80.0;
 
   // Fallback view_span_dm trước khi MapView layout xong (xem viewSpanMAt).
   static const _defaultViewSpanM = 200.0;
@@ -538,7 +538,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
       try {
         roads = await ref
             .read(overpassRoadServiceProvider)
-          .queryRoadsAround(lat: center.lat, lng: center.lng, radiusM: 500.0);
+          .queryRoadsAround(lat: center.lat, lng: center.lng, radiusM: 600.0);
         debugPrint('[MapData] Overpass → ${roads.length} roads');
       } catch (e) {
         debugPrint('[MapData] Overpass ERROR: $e');

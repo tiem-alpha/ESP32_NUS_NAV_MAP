@@ -153,7 +153,7 @@ const int _typeMapRoads = 0x32;
 const int _typeMapClock = 0x33;
 
 // Cửa sổ clip ~1.2 km quanh anchor (bán kính) — chỉ phần HUD nhìn thấy.
-const double _kMapWindowM = 1200.0;
+const double _kMapWindowM = 600.0;
 
 // Lead-in giữ lại trước vị trí hiện tại khi trim route đã đi (mượt khi vẽ).
 const double _kRouteLeadInM = 50.0;
