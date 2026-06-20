@@ -51,7 +51,13 @@ LV_FONT_DECLARE(lv_font_vi_12);
 /* ── Cấu hình panel / draw buffer ────────────────────────────────────── */
 #define LCD_H_RES        SCR_W   /* 240 */
 #define LCD_V_RES        SCR_H   /* 320 */
-#define LCD_DRAW_LINES   40      /* chiều cao 1 dải draw buffer (240×40) */
+/* H2: 40 lines × 2 buf × 240×2B = 38 KB DMA (tight). S3: 80 lines = 76 KB
+ * (still in internal SRAM); ít dải hơn → ít lần flush SPI → frame mượt hơn. */
+#ifdef CONFIG_SPIRAM
+  #define LCD_DRAW_LINES 80
+#else
+  #define LCD_DRAW_LINES 40
+#endif
 #define LCD_CMD_BITS     8
 #define LCD_PARAM_BITS   8
 #define LVGL_TICK_MS     2
@@ -94,8 +100,15 @@ static bool s_connected     = false;  /* lưu state nếu UI chưa dựng */
 static bool s_ui_ready      = false;
 
 /* Snapshot chụp trước khi invalidate — dùng chung cho tất cả dải của 1 frame.
- * Đảm bảo mọi strip render cùng 1 bộ dữ liệu, không bị đứt đoạn giữa frame. */
-static map_geom_t s_render_geom;
+ * Đảm bảo mọi strip render cùng 1 bộ dữ liệu, không bị đứt đoạn giữa frame.
+ * ESP32-S3 + PSRAM: cấp từ PSRAM (map_geom_t ~64 KB trên S3) — internal SRAM
+ * giành cho DMA draw buffer + LVGL heap. H2: static .bss như cũ. */
+#ifdef CONFIG_SPIRAM
+  static map_geom_t *s_render_geom_p;
+  #define s_render_geom (*s_render_geom_p)
+#else
+  static map_geom_t s_render_geom;
+#endif
 static map_pose_t s_render_pose;
 static bool       s_render_ready = false;
 
@@ -572,10 +585,21 @@ void display_init(void)
     /* Mutex đệ quy bảo vệ mọi gọi LVGL. */
     s_lvgl_mutex = xSemaphoreCreateRecursiveMutex();
 
+#ifdef CONFIG_SPIRAM
+    /* Snapshot render từ PSRAM — trên S3 map_geom_t ~64 KB.
+     * LVGL không đọc trực tiếp buffer này qua DMA nên PSRAM là OK. */
+    s_render_geom_p = heap_caps_malloc(sizeof(map_geom_t), MALLOC_CAP_SPIRAM);
+    assert(s_render_geom_p);
+    memset(s_render_geom_p, 0, sizeof(map_geom_t));
+    ESP_LOGI(DISP_TAG, "render_geom in PSRAM (%u B)", (unsigned)sizeof(map_geom_t));
+#endif
+
     /* 1) Panel ST7789. */
     panel_init();
 
-    /* 2) LVGL + partial draw buffer (2× 240×40, DMA internal RAM). */
+    /* 2) LVGL + partial draw buffer (DMA internal RAM — bắt buộc, SPI DMA
+     * không truy cập PSRAM trực tiếp trên cả H2 và S3 SPI mode).
+     * H2: 2×240×40 = 38 KB. S3: tăng LCD_DRAW_LINES vì còn nhiều internal RAM. */
     lv_init();
 
     size_t buf_px = LCD_H_RES * LCD_DRAW_LINES;
@@ -609,8 +633,14 @@ void display_init(void)
         lvgl_unlock();
     }
 
-    /* 5) Task render LVGL. */
+    /* 5) Task render LVGL.
+     * S3 dual-core: pin vào core 1 (APP_CPU) để BLE task chạy độc lập core 0.
+     * H2 single-core: xTaskCreate thường (core không quan trọng). */
+#ifdef CONFIG_SPIRAM
+    xTaskCreatePinnedToCore(lvgl_task, "lvgl_task", 12 * 1024, NULL, 2, NULL, 1);
+#else
     xTaskCreate(lvgl_task, "lvgl_task", 8 * 1024, NULL, 2, NULL);
+#endif
 
     ESP_LOGI(DISP_TAG, "Display + LVGL ready (partial buf %dx%d x2)",
              LCD_H_RES, LCD_DRAW_LINES);

@@ -7,12 +7,15 @@
  */
 #include "map_model.h"
 
+#include <math.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "sdkconfig.h"
 
 #include "nus_protocol.h"
 
@@ -21,8 +24,19 @@
 static map_pose_t        s_pose;
 static bool              s_has_pose;
 
-static map_geom_t        s_front;
-static map_geom_t        s_back;
+/* ESP32-H2 (không PSRAM): static .bss — ~8 KB/buffer, fit trong 84 KB heap còn lại.
+ * ESP32-S3 + PSRAM: cấp động từ PSRAM — ~64 KB/buffer (MAP_MAX_ROADS=256 ×
+ * MAP_MAX_ROAD_PTS=60); giải phóng toàn bộ internal SRAM cho Bluedroid + LVGL. */
+#ifdef CONFIG_SPIRAM
+  static map_geom_t       *s_front_p;
+  static map_geom_t       *s_back_p;
+  #define s_front  (*s_front_p)
+  #define s_back   (*s_back_p)
+#else
+  static map_geom_t        s_front;
+  static map_geom_t        s_back;
+#endif
+
 static SemaphoreHandle_t s_mutex;
 
 static uint8_t  s_route_seq;
@@ -86,11 +100,30 @@ static void map_on_route(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
     if (frag_total == 0) return;
 
     if (frag_idx == 0) {
-        /* Anchor thay đổi (resend sau ~800 m di chuyển): roads cũ không còn
-         * hợp lệ với anchor mới → xoá để tránh hiển thị roads lệch 800 m
-         * trong khoảng trống giữa MAP_ROUTE hoàn thành và MAP_ROADS đến. */
-        bool anchor_changed = (seq != s_route_seq);
-        if (anchor_changed) s_back.road_n = 0;
+        /* Re-encode road points từ roads_anchor cũ sang route_anchor mới.
+         * s_back.anchor_* hiện giữ roads_anchor (từ map_on_roads cuối).
+         * Nếu không re-encode: roads lệch ~8–15m trong khoảng trống BLE giữa
+         * MAP_ROUTE xong và MAP_ROADS đến, gây nháy. Phép tính O(road_n×pt_n)
+         * int16 ở đây — không tốn thêm RAM, không chạy trong hot render path. */
+        if (s_back.road_n > 0 && s_back.anchor_lat_e7 != 0) {
+            int32_t dlat_e7 = anchor_lat - s_back.anchor_lat_e7;
+            int32_t dlng_e7 = anchor_lng - s_back.anchor_lng_e7;
+            if (dlat_e7 != 0 || dlng_e7 != 0) {
+                float lat_rad = (float)s_back.anchor_lat_e7 * 1e-7f
+                                * (float)M_PI / 180.0f;
+                float cos_lat = cosf(lat_rad);
+                int16_t dn = (int16_t)lroundf(
+                    (float)dlat_e7 * 1e-7f * 111320.0f * 10.0f);
+                int16_t de = (int16_t)lroundf(
+                    (float)dlng_e7 * 1e-7f * 111320.0f * cos_lat * 10.0f);
+                for (int r = 0; r < s_back.road_n; r++) {
+                    for (int i = 0; i < s_back.roads[r].n; i++) {
+                        s_back.roads[r].pts[i].e_dm -= de;
+                        s_back.roads[r].pts[i].n_dm -= dn;
+                    }
+                }
+            }
+        }
         s_back.anchor_lat_e7 = anchor_lat;
         s_back.anchor_lng_e7 = anchor_lng;
         s_back.route_n       = 0;
@@ -98,9 +131,8 @@ static void map_on_route(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
         s_route_frag_total   = frag_total;
         s_route_next_frag    = 0;
         s_route_active       = true;
-        ESP_LOGI(MAP_TAG, "route seq=%u frags=%u anchor=(%ld,%ld)%s",
-                 seq, frag_total, anchor_lat, anchor_lng,
-                 anchor_changed ? " [anchor→reset roads]" : "");
+        ESP_LOGI(MAP_TAG, "route seq=%u frags=%u anchor=(%ld,%ld)",
+                 seq, frag_total, anchor_lat, anchor_lng);
     }
 
     if (!s_route_active || seq != s_route_seq || frag_idx != s_route_next_frag) {
@@ -177,7 +209,20 @@ static void map_on_roads(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
 void map_model_init(void)
 {
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
+
+#ifdef CONFIG_SPIRAM
+    if (!s_front_p) {
+        s_front_p = heap_caps_malloc(sizeof(map_geom_t), MALLOC_CAP_SPIRAM);
+        s_back_p  = heap_caps_malloc(sizeof(map_geom_t), MALLOC_CAP_SPIRAM);
+        ESP_LOGI(MAP_TAG, "geom buffers in PSRAM: 2 × %u B", (unsigned)sizeof(map_geom_t));
+    }
+    assert(s_front_p && s_back_p);
+    memset(s_front_p, 0, sizeof(map_geom_t));
+    memset(s_back_p,  0, sizeof(map_geom_t));
+#else
     memset(&s_back, 0, sizeof(s_back));
+#endif
+
     s_route_active = s_roads_active = false;
     s_back_route_ready = s_back_roads_ready = false;
 

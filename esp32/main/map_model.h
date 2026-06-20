@@ -15,9 +15,18 @@
 extern "C" {
 #endif
 
-#define MAP_MAX_ROUTE_PTS 200
-#define MAP_MAX_ROADS     64   /* 48→64: RAM giữ nguyên (64×122B = 48×162B); đủ phủ hẻm dày VN */
-#define MAP_MAX_ROAD_PTS  30   /* 40→30: giao hoán pts lấy roads; ~40m/pt đủ mượt ở HUD scale */
+/* Giới hạn buffer hình học — scale theo chip.
+ * ESP32-H2 (không PSRAM): giữ nhỏ để fit trong ~84 KB heap còn lại.
+ * ESP32-S3 + PSRAM: cấp từ PSRAM, có thể lớn hơn nhiều → mượt hơn, ít nháy. */
+#ifdef CONFIG_SPIRAM
+  #define MAP_MAX_ROUTE_PTS 500
+  #define MAP_MAX_ROADS     256
+  #define MAP_MAX_ROAD_PTS   60
+#else
+  #define MAP_MAX_ROUTE_PTS 200
+  #define MAP_MAX_ROADS      64
+  #define MAP_MAX_ROAD_PTS   30
+#endif
 
 typedef struct { int16_t e_dm, n_dm; } map_pt_t; /* north-up dm so với anchor */
 
