@@ -180,14 +180,16 @@ static inline lv_coord_t road_width_for_class(uint8_t road_class)
     return 2;                        /* service/khác */
 }
 
-/* Vẽ mũi tên user (tam giác trắng) hướng lên tại (USER_X, USER_Y). */
+/* Vẽ mũi tên user: arrowhead khuyết đáy, fill trắng, hướng lên tại (USER_X, USER_Y).
+ * 4 điểm: đỉnh trên → phải dưới → trọng tâm (indent đáy) → trái dưới.
+ * Centroid = (USER_Y-10 + USER_Y+5 + USER_Y+5)/3 = USER_Y → vị trí GPS đúng tâm. */
 static void draw_user_arrow(lv_draw_ctx_t *draw_ctx)
 {
-    static const lv_point_t tri[4] = {
-        { USER_X,      USER_Y - 12 },  /* đỉnh trên */
-        { USER_X - 9,  USER_Y + 9  },  /* trái dưới */
-        { USER_X + 9,  USER_Y + 9  },  /* phải dưới */
-        { USER_X,      USER_Y - 12 },  /* khép kín */
+    static const lv_point_t arrow[4] = {
+        { USER_X,      USER_Y - 10 },  /* đỉnh trên */
+        { USER_X + 7,  USER_Y + 5  },  /* phải dưới */
+        { USER_X,      USER_Y      },  /* trọng tâm — indent đáy */
+        { USER_X - 7,  USER_Y + 5  },  /* trái dưới */
     };
 
     lv_draw_line_dsc_t dsc;
@@ -197,10 +199,11 @@ static void draw_user_arrow(lv_draw_ctx_t *draw_ctx)
     dsc.round_start = 1;
     dsc.round_end = 1;
 
-    for (int i = 0; i < 3; i++) {
-        lv_draw_line(draw_ctx, &dsc, &tri[i], &tri[i + 1]);
+    for (int i = 0; i < 4; i++) {
+        lv_draw_line(draw_ctx, &dsc, &arrow[i], &arrow[i + 1]);
     }
-}
+     lv_draw_line(draw_ctx, &dsc, &arrow[0], &arrow[3]);
+     }
 
 /* Custom draw map: chạy trong LV_EVENT_DRAW_MAIN của s_map_obj. */
 static void map_draw_event_cb(lv_event_t *e)
