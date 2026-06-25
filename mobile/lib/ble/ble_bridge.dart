@@ -1115,9 +1115,11 @@ class BleBridge {
   }) async {
     for (var offset = 0; offset < data.length; offset += maxWriteLen) {
       final end = math.min(offset + maxWriteLen, data.length);
+      // withResponse: true để BLE layer ACK từng chunk trước khi gửi tiếp — tránh
+      // flood HCI queue khi frame lớn hơn MTU-3 và phải split thành nhiều ATT write.
       await _transport.write(
         Uint8List.sublistView(data, offset, end),
-        withResponse: false,
+        withResponse: true,
       );
     }
   }

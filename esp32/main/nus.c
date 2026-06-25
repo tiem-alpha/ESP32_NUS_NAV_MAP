@@ -812,6 +812,10 @@ static void nus_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t ga
         nus_emit_state(NUS_STATE_CONNECTED);
         nus_reset_idle_timeout();
         esp_ble_gap_update_conn_params(&conn_params);
+        /* Request LE Data Length Extension: 251-byte HCI payload thay vì 27 bytes mặc định.
+         * Giảm số HCI ACL fragments cho mỗi ATT write lớn (MAP_ROUTE/MAP_ROADS 200-400B):
+         * từ 8-15 fragments → 1-2 fragments → loại bỏ "ACL packet too short" reassembly lỗi. */
+        esp_ble_gap_set_pkt_data_len(param->connect.remote_bda, 251);
         break;
     }
 

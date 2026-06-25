@@ -45,7 +45,9 @@ class AppTheme {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
           ),
-          textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+          textStyle: GoogleFonts.beVietnamPro(
+  fontSize: 18, fontWeight: FontWeight.w700
+),
         ),
       ),
       segmentedButtonTheme: SegmentedButtonThemeData(
