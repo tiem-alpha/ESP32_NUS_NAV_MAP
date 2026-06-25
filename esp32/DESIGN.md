@@ -65,6 +65,8 @@ esp_err_t nus_protocol_register(uint8_t type, proto_handler_t h);
         ▼
  nus_protocol  (deframe SOF..CRC16, verify CRC16/MCRF4XX, dispatch theo TYPE)
         ├── 0x01 HELLO        → trả 0x02 DEVICE_INFO
+        ├── 0x03 SYSTEM_INFO  → device_manager (thông tin tĩnh)
+        ├── 0x04 DEVICE_STATUS→ device_manager (trạng thái động)
         ├── 0x10 NAV_INSTRUCTION → nav_model (+ ACK)
         ├── 0x11 DISTANCE_TICK   → nav_model
         ├── 0x12 SPEED_LIMIT     → nav_model
@@ -80,7 +82,7 @@ esp_err_t nus_protocol_register(uint8_t type, proto_handler_t h);
  display (LVGL: vẽ map canvas full-screen + overlay widgets) → ST7789
 ```
 
-Chiều ngược: nav_model/protocol → `nus_protocol` encode frame → `nus_send()` (TX notify): DEVICE_INFO, ACK, BTN_EVENT, HEARTBEAT.
+Chiều ngược: model/protocol → `nus_protocol` encode frame → `nus_send()` (TX notify): DEVICE_INFO, SYSTEM_INFO, DEVICE_STATUS, ACK, BTN_EVENT, HEARTBEAT.
 
 ---
 
@@ -159,6 +161,9 @@ Tối ưu: double buffer, dirty region (overlay đổi không vẽ lại cả ma
 ## 10. Device Info & Config
 
 - **DEVICE_INFO (0x02)** trả lời HELLO (0x01): `fw_ver` u16, `cap_bitmap` u16, `max_text` u8 (theo §6.2). `cap_bitmap` khai báo năng lực (hỗ trợ dấu tiếng Việt, speed limit, traffic sign…) để app điều chỉnh nội dung gửi.
+- **SYSTEM_INFO (0x03)** là thông tin tĩnh trong `model.h`: vendor/model/product ID, hardware version, ngày sản xuất, serial, battery/display support, screen type/size và MCU. Mobile chỉ đọc khi pair chưa có cache.
+- **DEVICE_STATUS (0x04)** là snapshot động: battery/charging, screen state, voltage, temperature, pin bitmask, uptime và free heap. Mobile đọc khi connect và poll định kỳ.
+- Bố cục LVGL và projection lấy `SCREEN_W/SCREEN_H`; kích thước, margin, badge, nét vẽ và vị trí user đều tính theo tỉ lệ màn hình.
 - Cấu hình day/night + brightness: lưu NVS; áp brightness qua PWM backlight, day/night đổi palette overlay/map.
 
 ---

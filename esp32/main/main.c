@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 
 #include "clock_model.h"
+#include "device_manager.h"
 #include "display.h"
 #include "map_model.h"
 #include "nav_model.h"
@@ -70,6 +71,7 @@ void app_main(void)
     nav_model_init();
     map_model_init();
     clock_model_init();
+    ESP_ERROR_CHECK(device_manager_init());
 
     /* NUS config. */
     nus_config_t nus_config = NUS_CONFIG_DEFAULT();

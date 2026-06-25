@@ -4,9 +4,8 @@
  *
  * display.c — ST7789 (esp_lcd SPI) + LVGL v8.3 full-screen map + overlay.
  *
- * Ràng buộc RAM (ESP32-H2, KHÔNG PSRAM, ~256KB): KHÔNG cấp full framebuffer
- * 240×320 (153KB). Dùng LVGL *partial draw buffer*: 2 dải 240×40 lv_color_t
- * (≈19KB/dải, DMA-capable internal RAM). 8 dải/frame → ít tearing hơn 16 dải.
+ * Ràng buộc RAM (ESP32-H2, KHÔNG PSRAM): không cấp full framebuffer.
+ * Dùng LVGL partial draw buffer theo tỉ lệ SCREEN_W × SCREEN_H.
  *
  * Map vẽ bằng custom draw (LV_EVENT_DRAW_MAIN của 1 obj full-screen) qua
  * lv_draw_line — KHÔNG lv_canvas. Overlay = widget LVGL con nền bán trong suốt.
@@ -49,14 +48,13 @@
 LV_FONT_DECLARE(lv_font_vi_12);
 
 /* ── Cấu hình panel / draw buffer ────────────────────────────────────── */
-#define LCD_H_RES        SCR_W   /* 240 */
-#define LCD_V_RES        SCR_H   /* 320 */
-/* H2: 40 lines × 2 buf × 240×2B = 38 KB DMA (tight). S3: 80 lines = 76 KB
- * (still in internal SRAM); ít dải hơn → ít lần flush SPI → frame mượt hơn. */
+#define LCD_H_RES        SCR_W
+#define LCD_V_RES        SCR_H
+/* Draw buffer theo tỉ lệ chiều cao, không phụ thuộc một độ phân giải cụ thể. */
 #ifdef CONFIG_SPIRAM
-  #define LCD_DRAW_LINES 80
+  #define LCD_DRAW_LINES ((LCD_V_RES + 3) / 4)
 #else
-  #define LCD_DRAW_LINES 40
+  #define LCD_DRAW_LINES ((LCD_V_RES + 7) / 8)
 #endif
 #define LCD_CMD_BITS     8
 #define LCD_PARAM_BITS   8
@@ -98,6 +96,38 @@ static lv_obj_t *s_clock_label  = NULL;  /* đồng hồ thực "07:42" */
 
 static bool s_connected     = false;  /* lưu state nếu UI chưa dựng */
 static bool s_ui_ready      = false;
+
+/* ── Responsive layout helpers (tỉ lệ phần nghìn của màn hình) ─────────── */
+static inline lv_coord_t ratio_w(uint16_t permille)
+{
+    lv_coord_t value = (lv_coord_t)(((uint32_t)LCD_H_RES * permille + 500u) / 1000u);
+    return value > 0 ? value : 1;
+}
+
+static inline lv_coord_t ratio_h(uint16_t permille)
+{
+    lv_coord_t value = (lv_coord_t)(((uint32_t)LCD_V_RES * permille + 500u) / 1000u);
+    return value > 0 ? value : 1;
+}
+
+static inline lv_coord_t ratio_min(uint16_t permille)
+{
+    const uint32_t side = LCD_H_RES < LCD_V_RES ? LCD_H_RES : LCD_V_RES;
+    lv_coord_t value = (lv_coord_t)((side * permille + 500u) / 1000u);
+    return value > 0 ? value : 1;
+}
+
+static const lv_font_t *font_for_ratio(uint16_t permille)
+{
+    lv_coord_t px = ratio_min(permille);
+    if (px >= 22) return &lv_font_montserrat_24;
+    if (px >= 19) return &lv_font_montserrat_20;
+    if (px >= 16) return &lv_font_montserrat_18;
+    if (px >= 13) return &lv_font_montserrat_14;
+    if (px >= 11) return &lv_font_montserrat_12;
+    if (px >= 9) return &lv_font_montserrat_10;
+    return &lv_font_montserrat_8;
+}
 
 /* Snapshot chụp trước khi invalidate — dùng chung cho tất cả dải của 1 frame.
  * Đảm bảo mọi strip render cùng 1 bộ dữ liệu, không bị đứt đoạn giữa frame.
@@ -187,10 +217,10 @@ static void draw_polyline(lv_draw_ctx_t *draw_ctx, lv_draw_line_dsc_t *dsc,
 /* Độ dày đường theo class: class nhỏ (đường lớn) → dày hơn. */
 static inline lv_coord_t road_width_for_class(uint8_t road_class)
 {
-    if (road_class <= 1) return 5;   /* motorway/trunk */
-    if (road_class <= 3) return 4;   /* primary/secondary */
-    if (road_class <= 5) return 3;   /* tertiary/residential */
-    return 2;                        /* service/khác */
+    if (road_class <= 1) return ratio_min(21); /* motorway/trunk */
+    if (road_class <= 3) return ratio_min(17); /* primary/secondary */
+    if (road_class <= 5) return ratio_min(13); /* tertiary/residential */
+    return ratio_min(8);                         /* service/khác */
 }
 
 /* Vẽ mũi tên user: arrowhead khuyết đáy, fill trắng, hướng lên tại (USER_X, USER_Y).
@@ -198,25 +228,28 @@ static inline lv_coord_t road_width_for_class(uint8_t road_class)
  * Centroid = (USER_Y-10 + USER_Y+5 + USER_Y+5)/3 = USER_Y → vị trí GPS đúng tâm. */
 static void draw_user_arrow(lv_draw_ctx_t *draw_ctx)
 {
-    static const lv_point_t arrow[4] = {
-        { USER_X,      USER_Y - 10 },  /* đỉnh trên */
-        { USER_X + 7,  USER_Y + 5  },  /* phải dưới */
-        { USER_X,      USER_Y      },  /* trọng tâm — indent đáy */
-        { USER_X - 7,  USER_Y + 5  },  /* trái dưới */
+    const lv_coord_t half_w = ratio_min(29);
+    const lv_coord_t tip_h = ratio_min(42);
+    const lv_coord_t tail_h = ratio_min(21);
+    const lv_point_t arrow[4] = {
+        { USER_X,          USER_Y - tip_h  }, /* đỉnh trên */
+        { USER_X + half_w, USER_Y + tail_h }, /* phải dưới */
+        { USER_X,          USER_Y          }, /* indent đáy */
+        { USER_X - half_w, USER_Y + tail_h }, /* trái dưới */
     };
 
     lv_draw_line_dsc_t dsc;
     lv_draw_line_dsc_init(&dsc);
     dsc.color = COL_USER;
-    dsc.width = 3;
+    dsc.width = ratio_min(13);
     dsc.round_start = 1;
     dsc.round_end = 1;
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 3; i++) {
         lv_draw_line(draw_ctx, &dsc, &arrow[i], &arrow[i + 1]);
     }
-     lv_draw_line(draw_ctx, &dsc, &arrow[0], &arrow[3]);
-     }
+    lv_draw_line(draw_ctx, &dsc, &arrow[3], &arrow[0]);
+}
 
 /* Custom draw map: chạy trong LV_EVENT_DRAW_MAIN của s_map_obj. */
 static void map_draw_event_cb(lv_event_t *e)
@@ -254,7 +287,7 @@ static void map_draw_event_cb(lv_event_t *e)
     lv_draw_line_dsc_t route_dsc;
     lv_draw_line_dsc_init(&route_dsc);
     route_dsc.color = COL_ROUTE;
-    route_dsc.width = 6;
+    route_dsc.width = ratio_min(25);
     route_dsc.round_start = 1;
     route_dsc.round_end = 1;
     draw_polyline(draw_ctx, &route_dsc, s_render_geom.route, s_render_geom.route_n, &proj);
@@ -273,8 +306,8 @@ static lv_obj_t *make_panel(lv_obj_t *parent)
     lv_obj_set_style_bg_color(p, COL_PANEL, 0);
     lv_obj_set_style_bg_opa(p, LV_OPA_70, 0);
     lv_obj_set_style_border_width(p, 0, 0);
-    lv_obj_set_style_radius(p, 8, 0);
-    lv_obj_set_style_pad_all(p, 6, 0);
+    lv_obj_set_style_radius(p, ratio_min(33), 0);
+    lv_obj_set_style_pad_all(p, ratio_min(25), 0);
     return p;
 }
 
@@ -308,6 +341,12 @@ static const char *maneuver_glyph(maneuver_e m)
 /* ── Xây UI ──────────────────────────────────────────────────────────── */
 static void build_ui(void)
 {
+    const lv_coord_t margin = ratio_min(17);
+    const lv_coord_t top_h = ratio_h(160);
+    const lv_coord_t badge_size = ratio_min(192);
+    const lv_coord_t bottom_h = ratio_h(106);
+    const lv_coord_t left_text_x = ratio_w(150);
+
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, COL_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -323,43 +362,46 @@ static void build_ui(void)
 
     /* ── Overlay TRÊN-TRÁI: mũi tên rẽ + khoảng cách + tên đường. ── */
     lv_obj_t *top_left = make_panel(scr);
-    lv_obj_set_size(top_left, 240, 50 );
-    lv_obj_align(top_left, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_coord_t top_w = LCD_H_RES - badge_size - margin * 3;
+    if (top_w < ratio_w(500)) top_w = ratio_w(500);
+    lv_obj_set_size(top_left, top_w, top_h);
+    lv_obj_align(top_left, LV_ALIGN_TOP_LEFT, margin, margin);
 
     s_turn_label = lv_label_create(top_left);
-    lv_obj_set_style_text_font(s_turn_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_font(s_turn_label, font_for_ratio(100), 0);
     lv_obj_set_style_text_color(s_turn_label, COL_TEXT, 0);
     lv_label_set_text(s_turn_label, LV_SYMBOL_UP);
-    lv_obj_align(s_turn_label, LV_ALIGN_LEFT_MID, 0, -8);
+    lv_obj_align(s_turn_label, LV_ALIGN_LEFT_MID, 0, -ratio_h(25));
 
     s_dist_label = lv_label_create(top_left);
-    lv_obj_set_style_text_font(s_dist_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(s_dist_label, font_for_ratio(83), 0);
     lv_obj_set_style_text_color(s_dist_label, COL_TEXT, 0);
     lv_label_set_text(s_dist_label, "-- m");
-    lv_obj_align(s_dist_label, LV_ALIGN_TOP_LEFT, 36, 0);
+    lv_obj_align(s_dist_label, LV_ALIGN_TOP_LEFT, left_text_x, 0);
 
     s_street_label = lv_label_create(top_left);
     lv_obj_set_style_text_font(s_street_label, &lv_font_vi_12, 0);
     lv_obj_set_style_text_color(s_street_label, COL_TEXT, 0);
     lv_label_set_long_mode(s_street_label, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_street_label, 110);
+    lv_coord_t street_w = top_w - left_text_x - ratio_min(50);
+    lv_obj_set_width(s_street_label, street_w > 1 ? street_w : 1);
     lv_label_set_text(s_street_label, "");
-    lv_obj_align(s_street_label, LV_ALIGN_BOTTOM_LEFT, 36, 0);
+    lv_obj_align(s_street_label, LV_ALIGN_BOTTOM_LEFT, left_text_x, 0);
 
     /* ── Overlay TRÊN-PHẢI: biển tốc độ (badge tròn). ── */
     s_limit_panel = lv_obj_create(scr);
     lv_obj_clear_flag(s_limit_panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(s_limit_panel, 46, 46);
-    lv_obj_align(s_limit_panel, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_set_size(s_limit_panel, badge_size, badge_size);
+    lv_obj_align(s_limit_panel, LV_ALIGN_TOP_RIGHT, -margin, margin);
     lv_obj_set_style_radius(s_limit_panel, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(s_limit_panel, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(s_limit_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(s_limit_panel, COL_LIMIT_RING, 0);
-    lv_obj_set_style_border_width(s_limit_panel, 4, 0);
+    lv_obj_set_style_border_width(s_limit_panel, ratio_min(17), 0);
     lv_obj_set_style_pad_all(s_limit_panel, 0, 0);
 
     s_limit_label = lv_label_create(s_limit_panel);
-    lv_obj_set_style_text_font(s_limit_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(s_limit_label, font_for_ratio(75), 0);
     lv_obj_set_style_text_color(s_limit_label, lv_color_black(), 0);
     lv_label_set_text(s_limit_label, "");
     lv_obj_center(s_limit_label);
@@ -367,22 +409,22 @@ static void build_ui(void)
 
     /* ── Overlay DƯỚI-TRÁI: tốc độ hiện tại. ── */
     lv_obj_t *bot_left = make_panel(scr);
-    lv_obj_set_size(bot_left, 100, 34);
-    lv_obj_align(bot_left, LV_ALIGN_BOTTOM_LEFT, 4, -4);
+    lv_obj_set_size(bot_left, ratio_w(417), bottom_h);
+    lv_obj_align(bot_left, LV_ALIGN_BOTTOM_LEFT, margin, -margin);
 
     s_speed_label = lv_label_create(bot_left);
-    lv_obj_set_style_text_font(s_speed_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(s_speed_label, font_for_ratio(75), 0);
     lv_obj_set_style_text_color(s_speed_label, COL_TEXT, 0);
     lv_label_set_text(s_speed_label, "0 km/h");
     lv_obj_center(s_speed_label);
 
     /* ── Overlay DƯỚI-PHẢI: ETA + còn lại. ── */
     lv_obj_t *bot_right = make_panel(scr);
-    lv_obj_set_size(bot_right, 120, 34);
-    lv_obj_align(bot_right, LV_ALIGN_BOTTOM_RIGHT, -4, -4);
+    lv_obj_set_size(bot_right, ratio_w(500), bottom_h);
+    lv_obj_align(bot_right, LV_ALIGN_BOTTOM_RIGHT, -margin, -margin);
 
     s_eta_label = lv_label_create(bot_right);
-    lv_obj_set_style_text_font(s_eta_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_eta_label, font_for_ratio(58), 0);
     lv_obj_set_style_text_color(s_eta_label, COL_TEXT, 0);
     lv_label_set_text(s_eta_label, "--:-- · -- km");
     lv_obj_center(s_eta_label);
@@ -390,8 +432,9 @@ static void build_ui(void)
     /* ── Chấm trạng thái BLE (góc trên giữa). ── */
     s_ble_dot = lv_obj_create(scr);
     lv_obj_clear_flag(s_ble_dot, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(s_ble_dot, 12, 12);
-    lv_obj_align(s_ble_dot, LV_ALIGN_TOP_MID, 0, 6);
+    lv_coord_t dot_size = ratio_min(50);
+    lv_obj_set_size(s_ble_dot, dot_size, dot_size);
+    lv_obj_align(s_ble_dot, LV_ALIGN_TOP_MID, 0, ratio_h(19));
     lv_obj_set_style_radius(s_ble_dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_border_width(s_ble_dot, 0, 0);
     lv_obj_set_style_bg_color(s_ble_dot, s_connected ? COL_DOT_ON : COL_DOT_OFF, 0);
@@ -403,7 +446,7 @@ static void build_ui(void)
     // lv_obj_align(clock_panel, LV_ALIGN_TOP_MID, 0, 22);
 
     s_clock_label = lv_label_create(top_left);
-    lv_obj_set_style_text_font(s_clock_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(s_clock_label, font_for_ratio(83), 0);
     lv_obj_set_style_text_color(s_clock_label, COL_TEXT, 0);
     lv_label_set_text(s_clock_label, "--:--");
     lv_obj_align(s_clock_label, LV_ALIGN_TOP_RIGHT, 0, 0);
@@ -598,8 +641,7 @@ void display_init(void)
     panel_init();
 
     /* 2) LVGL + partial draw buffer (DMA internal RAM — bắt buộc, SPI DMA
-     * không truy cập PSRAM trực tiếp trên cả H2 và S3 SPI mode).
-     * H2: 2×240×40 = 38 KB. S3: tăng LCD_DRAW_LINES vì còn nhiều internal RAM. */
+     * không truy cập PSRAM trực tiếp trên cả H2 và S3 SPI mode). */
     lv_init();
 
     size_t buf_px = LCD_H_RES * LCD_DRAW_LINES;

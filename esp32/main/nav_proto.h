@@ -20,11 +20,11 @@ extern "C" {
 /* Message TYPE (§6.2) */
 enum {
     MSG_HELLO           = 0x01, /* App→Dev: proto_ver u8 */
-    MSG_DEVICE_INFO     = 0x02, /* Dev→App: fw_ver  */
-    MSG_SYSTEM_INFO    = 0x03, /* Dev→App: vendor ID , model ID, product ID , HARDWARE version, manufacturer date, serial number, battery support, support screen(0 not sp), 
-    screen type (0: not supported, 1: mono , 2  565, 3: 888), creen W, screen H, MCU description */ 
-    MSG_DEVICE_STATUS    = 0x04, /* Dev→App: pin,   */
-    MSG_DEVICE_CONFIG    = 0x05, /* App→Dev: sleep timer, brigness, scale(zoom level), light mode, font size, ..TBD   */
+    MSG_DEVICE_INFO     = 0x02, /* Dev→App: legacy handshake: fw_ver u16, cap u16, max_text u8 */
+    MSG_SYSTEM_INFO     = 0x03, /* App→Dev empty request; Dev→App static product/display info */
+    MSG_DEVICE_STATUS   = 0x04, /* App→Dev empty request; Dev→App live status */
+    MSG_DEVICE_CONFIG   = 0x05, /* App→Dev: sleep/brightness/zoom/theme/font (reserved) */
+    MSG_NAV_INSTRUCTION = 0x10, /* App→Dev: §6.3 */
     MSG_DISTANCE_TICK   = 0x11, /* App→Dev: dist_to_man u16, dist_remain u32, eta u16(min), speed u8 */
     MSG_SPEED_LIMIT     = 0x12, /* App→Dev: limit u8, is_over u8 */
     MSG_TRAFFIC_SIGN    = 0x13, /* App→Dev: sign_type u8, dist u16, value u8 */
@@ -67,6 +67,42 @@ typedef enum { NAV_IDLE = 0, NAV_NAVIGATING, NAV_REROUTING, NAV_ARRIVED } nav_st
 #define CAP_TRAFFIC_SIGN (1u << 2)
 #define CAP_LANE_INFO    (1u << 3)
 #define CAP_BUTTONS      (1u << 4)
+
+/* SYSTEM_INFO (0x03), schema version 1. */
+#define SYSTEM_INFO_SCHEMA_V1 1u
+
+typedef enum {
+    SCREEN_TYPE_NONE   = 0,
+    SCREEN_TYPE_MONO   = 1,
+    SCREEN_TYPE_RGB565 = 2,
+    SCREEN_TYPE_RGB888 = 3,
+} screen_type_e;
+
+/*
+ * SYSTEM_INFO payload v1:
+ * schema u8,
+ * vendor_id u32, model_id u32, product_id u32, hardware_version u32,
+ * support_battery u8, support_screen u8, screen_type u8, reserved u8,
+ * screen_w u16, screen_h u16,
+ * manufacturer_date_len u8, serial_len u8, mcu_desc_len u8,
+ * manufacturer_date[], serial_number[], mcu_desc[] (UTF-8).
+ */
+
+/* DEVICE_STATUS (0x04), schema version 1. */
+#define DEVICE_STATUS_SCHEMA_V1       1u
+#define DEVICE_STATUS_BATTERY_PRESENT (1u << 0)
+#define DEVICE_STATUS_CHARGING        (1u << 1)
+#define DEVICE_STATUS_SCREEN_ON       (1u << 2)
+#define DEVICE_STATUS_LOW_POWER       (1u << 3)
+#define DEVICE_STATUS_VALUE_UNKNOWN   0xFFu
+#define DEVICE_STATUS_TEMP_UNKNOWN    INT16_MIN
+
+/*
+ * DEVICE_STATUS payload v1:
+ * schema u8, flags u16, battery_percent u8 (0..100, 255=unknown),
+ * supply_mv u16 (0=unknown), temperature_cdec i16 (INT16_MIN=unknown),
+ * pin_state u32, uptime_s u32, free_heap_bytes u32.
+ */
 
 /* ── Live pose đã decode (MAP_POSE 0x30) ─────────────────────────────── */
 typedef struct {

@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "model.h"
 
 #define PROTO_TAG "NUS_PROTO"
 
@@ -22,7 +23,7 @@
 #define PROTO_TX_WAIT_MS  100
 
 /* DEVICE_INFO trả lời HELLO (§6.2). */
-#define PROTO_FW_VER      0x0100  /* uint16, "1.00" kiểu app tự hiểu */
+#define PROTO_FW_VER      FIRMWARE_VERSION
 #define PROTO_MAX_TEXT    48
 #define PROTO_CAP_BITMAP  (CAP_DIACRITICS | CAP_SPEED_LIMIT | CAP_TRAFFIC_SIGN)
 

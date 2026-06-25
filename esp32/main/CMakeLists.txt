@@ -4,6 +4,7 @@ idf_component_register(SRCS   "main.c"
                               "nav_model.c"
                               "map_model.c"
                               "clock_model.c"
+                              "device_manager.c"
                               "projection.c"
                               "display.c"
                              
