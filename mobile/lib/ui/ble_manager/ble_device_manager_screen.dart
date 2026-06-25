@@ -101,6 +101,8 @@ class _BleDeviceManagerScreenState
 
   Widget _currentDeviceCard(BleStatus status, DiscoveredDevice? pairedDevice) {
     final info = status.info;
+    final systemInfo = status.systemInfo;
+    final deviceStatus = status.deviceStatus;
     final connected = status.state == BleConnectionState.connected;
     final connecting = status.state == BleConnectionState.connecting;
     final disconnected = status.state == BleConnectionState.disconnected;
@@ -170,6 +172,61 @@ class _BleDeviceManagerScreenState
                 color: context.scheme.onSurfaceVariant,
               ),
             ),
+            if (systemInfo != null) ...[
+              const SizedBox(height: 12),
+              const Divider(height: 1),
+              const SizedBox(height: 12),
+              Text(
+                '${systemInfo.mcuDescription} · ${systemInfo.screenType.label} '
+                '${systemInfo.screenWidth}×${systemInfo.screenHeight}',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Vendor ${systemInfo.vendorIdString} · '
+                'Model ${systemInfo.modelIdString} · '
+                'Product ${systemInfo.productIdString}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              Text(
+                'HW ${systemInfo.hardwareVersionString} · '
+                'SN ${systemInfo.serialNumber} · '
+                '${systemInfo.manufacturerDate}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+            if (deviceStatus != null) ...[
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  _statusChip(
+                    Icons.memory,
+                    'Heap ${(deviceStatus.freeHeapBytes / 1024).round()} KB',
+                  ),
+                  _statusChip(
+                    Icons.timer_outlined,
+                    'Uptime ${_formatUptime(deviceStatus.uptime)}',
+                  ),
+                  if (deviceStatus.batteryPresent)
+                    _statusChip(
+                      deviceStatus.charging
+                          ? Icons.battery_charging_full
+                          : Icons.battery_std,
+                      deviceStatus.batteryPercent == null
+                          ? 'Battery —'
+                          : 'Battery ${deviceStatus.batteryPercent}%',
+                    ),
+                  _statusChip(
+                    deviceStatus.screenOn
+                        ? Icons.screen_lock_portrait
+                        : Icons.screen_lock_portrait_outlined,
+                    deviceStatus.screenOn ? 'Screen on' : 'Screen off',
+                  ),
+                ],
+              ),
+            ],
             const SizedBox(height: 12),
             Wrap(
               spacing: 8,
@@ -214,6 +271,20 @@ class _BleDeviceManagerScreenState
         ),
       ),
     );
+  }
+
+  Widget _statusChip(IconData icon, String label) {
+    return Chip(
+      visualDensity: VisualDensity.compact,
+      avatar: Icon(icon, size: 16),
+      label: Text(label),
+    );
+  }
+
+  String _formatUptime(Duration uptime) {
+    final hours = uptime.inHours;
+    final minutes = uptime.inMinutes.remainder(60);
+    return hours > 0 ? '${hours}h ${minutes}m' : '${minutes}m';
   }
 
   Widget _scanHeader(BleScanState scan) {

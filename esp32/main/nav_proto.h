@@ -20,8 +20,11 @@ extern "C" {
 /* Message TYPE (§6.2) */
 enum {
     MSG_HELLO           = 0x01, /* App→Dev: proto_ver u8 */
-    MSG_DEVICE_INFO     = 0x02, /* Dev→App: fw_ver u16, cap_bitmap u16, max_text u8 */
-    MSG_NAV_INSTRUCTION = 0x10, /* App→Dev: §6.3 */
+    MSG_DEVICE_INFO     = 0x02, /* Dev→App: fw_ver  */
+    MSG_SYSTEM_INFO    = 0x03, /* Dev→App: vendor ID , model ID, product ID , HARDWARE version, manufacturer date, serial number, battery support, support screen(0 not sp), 
+    screen type (0: not supported, 1: mono , 2  565, 3: 888), creen W, screen H, MCU description */ 
+    MSG_DEVICE_STATUS    = 0x04, /* Dev→App: pin,   */
+    MSG_DEVICE_CONFIG    = 0x05, /* App→Dev: sleep timer, brigness, scale(zoom level), light mode, font size, ..TBD   */
     MSG_DISTANCE_TICK   = 0x11, /* App→Dev: dist_to_man u16, dist_remain u32, eta u16(min), speed u8 */
     MSG_SPEED_LIMIT     = 0x12, /* App→Dev: limit u8, is_over u8 */
     MSG_TRAFFIC_SIGN    = 0x13, /* App→Dev: sign_type u8, dist u16, value u8 */
@@ -34,7 +37,6 @@ enum {
     MSG_MAP_ROADS       = 0x32, /* App→Dev: §6.2.1 (anchor + frag) */
     MSG_MAP_CLOCK       = 0x33, /* App→Dev: epoch_s u32, tz_offset_min i16 */
 };
-
 /* maneuver_e — khớp Dart ManeuverType.wire */
 typedef enum {
     MAN_DEPART = 0, MAN_STRAIGHT, MAN_TURN_SLIGHT_LEFT, MAN_TURN_LEFT,

@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../ble/ble_bridge.dart';
+import '../../models/ble_device.dart';
 import '../../models/geo_point.dart';
 import '../../models/maneuver_type.dart';
 import '../../models/nav_state.dart';
@@ -38,7 +40,8 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
 
   // --- Cache roads quanh user (READ ONLY service) ---
   List<RoadSegment> _roads = const [];
-  List<RoadSegment> _roadsLastGood = const []; // cache lần query thành công cuối
+  List<RoadSegment> _roadsLastGood =
+      const []; // cache lần query thành công cuối
   GeoPoint? _roadsAnchor; // điểm đã fetch roads gần nhất
   bool _roadsLoading = false;
 
@@ -93,7 +96,11 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
   }
 
   /// Lấy dữ liệu: ưu tiên BLE Live (chính xác với ESP32) → NavSnapshot → Demo.
-  _HudData _resolveData(NavSnapshot snap, BleMapSnapshot? bleSnap) {
+  _HudData _resolveData(
+    NavSnapshot snap,
+    BleMapSnapshot? bleSnap,
+    HudDisplayConfig displayConfig,
+  ) {
     // BLE Live — dùng đúng dữ liệu đã gửi (DP-simplified, zoom khớp ESP32).
     if (!_demo && bleSnap != null) {
       return _HudData(
@@ -111,11 +118,13 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
         gpsWeak: !bleSnap.gpsFix,
         isDemo: false,
         isBle: true,
-        pxPerMOverride: 240.0 / bleSnap.viewSpanM.clamp(10, 5000),
+        pxPerMOverride:
+            displayConfig.screenW / bleSnap.viewSpanM.clamp(10, 5000),
       );
     }
 
-    final realActive = !_demo &&
+    final realActive =
+        !_demo &&
         snap.phase == NavPhase.navigating &&
         snap.route != null &&
         (snap.matchedPosition ?? snap.currentPosition) != null;
@@ -165,7 +174,9 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
   }
 
   double _demoRemainingM(GeoPoint from) {
-    var total = from.distanceTo(_demoRoute[(_demoIndex + 1) % _demoRoute.length]);
+    var total = from.distanceTo(
+      _demoRoute[(_demoIndex + 1) % _demoRoute.length],
+    );
     for (var i = _demoIndex + 1; i < _demoRoute.length - 1; i++) {
       total += _demoRoute[i].distanceTo(_demoRoute[i + 1]);
     }
@@ -176,21 +187,24 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
   Future<void> _maybeFetchRoads() async {
     final NavSnapshot snap = ref.read(navControllerProvider);
     final bleSnap = ref.read(bleMapSnapshotProvider).whenOrNull(data: (s) => s);
-    final data = _resolveData(snap, bleSnap);
+    final displayConfig = ref.read(hudDisplayConfigProvider);
+    final data = _resolveData(snap, bleSnap, displayConfig);
     final user = data.user;
     if (_roadsLoading) return;
     final anchor = _roadsAnchor;
     if (anchor != null && anchor.distanceTo(user) < 300) return;
 
-    debugPrint('[HudSim] _maybeFetchRoads: user=${user.lat.toStringAsFixed(5)},${user.lng.toStringAsFixed(5)} anchor=${anchor == null ? "null" : "${anchor.lat.toStringAsFixed(5)},${anchor.lng.toStringAsFixed(5)}"}');
+    debugPrint(
+      '[HudSim] _maybeFetchRoads: user=${user.lat.toStringAsFixed(5)},${user.lng.toStringAsFixed(5)} anchor=${anchor == null ? "null" : "${anchor.lat.toStringAsFixed(5)},${anchor.lng.toStringAsFixed(5)}"}',
+    );
     _roadsLoading = true;
     try {
-      final roads = await ref.read(overpassRoadServiceProvider).queryRoadsAround(
-            lat: user.lat,
-            lng: user.lng,
-            radiusM: 1500,
-          );
-      debugPrint('[HudSim] _maybeFetchRoads: got ${roads.length} roads → setState');
+      final roads = await ref
+          .read(overpassRoadServiceProvider)
+          .queryRoadsAround(lat: user.lat, lng: user.lng, radiusM: 1500);
+      debugPrint(
+        '[HudSim] _maybeFetchRoads: got ${roads.length} roads → setState',
+      );
       if (!mounted) return;
       if (roads.isNotEmpty) _roadsLastGood = roads;
       setState(() {
@@ -208,20 +222,23 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
 
   /// Tuyến demo: vài điểm quanh Hà Nội (Hồ Hoàn Kiếm → quanh phố cổ).
   List<GeoPoint> _buildDemoRoute() => const [
-        GeoPoint(21.0285, 105.8542),
-        GeoPoint(21.0312, 105.8540),
-        GeoPoint(21.0330, 105.8525),
-        GeoPoint(21.0335, 105.8495),
-        GeoPoint(21.0360, 105.8480),
-        GeoPoint(21.0388, 105.8472),
-        GeoPoint(21.0405, 105.8450),
-      ];
+    GeoPoint(21.0285, 105.8542),
+    GeoPoint(21.0312, 105.8540),
+    GeoPoint(21.0330, 105.8525),
+    GeoPoint(21.0335, 105.8495),
+    GeoPoint(21.0360, 105.8480),
+    GeoPoint(21.0388, 105.8472),
+    GeoPoint(21.0405, 105.8450),
+  ];
 
   @override
   Widget build(BuildContext context) {
     final snap = ref.watch(navControllerProvider);
-    final bleSnap = ref.watch(bleMapSnapshotProvider).whenOrNull(data: (s) => s);
-    final data = _resolveData(snap, bleSnap);
+    final bleSnap = ref
+        .watch(bleMapSnapshotProvider)
+        .whenOrNull(data: (s) => s);
+    final displayConfig = ref.watch(hudDisplayConfigProvider);
+    final data = _resolveData(snap, bleSnap, displayConfig);
     final theme = Theme.of(context);
 
     return Scaffold(
@@ -241,8 +258,8 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
                       data.isDemo
                           ? 'Đang dùng tuyến & xe mô phỏng'
                           : (data.isBle
-                              ? 'BLE Live — dữ liệu thật gửi ESP32'
-                              : 'Dữ liệu NavSnapshot (BLE chưa kết nối)'),
+                                ? 'BLE Live — dữ liệu thật gửi ESP32'
+                                : 'Dữ liệu NavSnapshot (BLE chưa kết nối)'),
                     ),
                     value: _demo,
                     onChanged: (v) {
@@ -258,7 +275,9 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
           Expanded(
             child: Center(
               child: _DeviceBezel(
+                displayConfig: displayConfig,
                 child: _HudView(
+                  displayConfig: displayConfig,
                   data: data,
                   // BLE Live: roads đã gửi thật; còn lại dùng Overpass local.
                   roads: data.isBle ? data.roads : _roads,
@@ -271,7 +290,8 @@ class _HudSimScreenState extends ConsumerState<HudSimScreen> {
           Padding(
             padding: const EdgeInsets.all(12),
             child: Text(
-              'Khung 240×320 — chiếu heading-up, user neo giữa-dưới (giống HUD ESP32).',
+              'Khung ${displayConfig.screenW}×${displayConfig.screenH} · '
+              '${displayConfig.screenType.label} · heading-up.',
               textAlign: TextAlign.center,
               style: theme.textTheme.bodySmall,
             ),
@@ -323,33 +343,56 @@ class _HudData {
   });
 }
 
-/// Vỏ thiết bị (bezel) giữ đúng tỉ lệ 240×320.
+/// Vỏ thiết bị giữ đúng tỉ lệ màn hình khai báo trong SYSTEM_INFO.
 class _DeviceBezel extends StatelessWidget {
+  final HudDisplayConfig displayConfig;
   final Widget child;
-  const _DeviceBezel({required this.child});
+  const _DeviceBezel({required this.displayConfig, required this.child});
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: const Color(0xFF0A0A0A),
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: const [
-          BoxShadow(color: Colors.black54, blurRadius: 12, offset: Offset(0, 6)),
-        ],
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: AspectRatio(
-          aspectRatio: HudFrame.width / HudFrame.height,
-          child: SizedBox(
-            width: HudFrame.width,
-            height: HudFrame.height,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final media = MediaQuery.sizeOf(context);
+        final maxWidth =
+            (constraints.maxWidth.isFinite
+                ? constraints.maxWidth
+                : media.width) *
+            0.82;
+        final maxHeight =
+            (constraints.maxHeight.isFinite
+                ? constraints.maxHeight
+                : media.height) *
+            0.92;
+        final aspect = displayConfig.aspectRatio;
+        final screenWidth = maxWidth / maxHeight > aspect
+            ? maxHeight * aspect
+            : maxWidth;
+        final screenHeight = screenWidth / aspect;
+        final shortSide = math.min(screenWidth, screenHeight);
+        final bezel = shortSide * 0.04;
+
+        return Container(
+          width: screenWidth + bezel * 2,
+          height: screenHeight + bezel * 2,
+          padding: EdgeInsets.all(bezel),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0A0A0A),
+            borderRadius: BorderRadius.circular(shortSide * 0.08),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black54,
+                blurRadius: shortSide * 0.05,
+                offset: Offset(0, shortSide * 0.025),
+              ),
+            ],
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(shortSide * 0.04),
             child: child,
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -357,12 +400,14 @@ class _DeviceBezel extends StatelessWidget {
 /// Layer map (CustomPaint) + overlay (widget Flutter đè lên) — overlay dạng
 /// widget cho text/icon sắc nét hơn vẽ trong painter (DESIGN §8).
 class _HudView extends StatelessWidget {
+  final HudDisplayConfig displayConfig;
   final _HudData data;
   final List<RoadSegment> roads;
   final Color routeColor;
   final Color roadColor;
 
   const _HudView({
+    required this.displayConfig,
     required this.data,
     required this.roads,
     required this.routeColor,
@@ -371,117 +416,141 @@ class _HudView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        // --- Map layer ---
-        CustomPaint(
-          painter: HudPainter(
-            user: data.user,
-            headingDeg: data.heading,
-            routeGeometry: data.route,
-            roads: roads,
-            speedKmh: data.speedKmh,
-            routeColor: routeColor,
-            roadColor: roadColor,
-            pxPerMOverride: data.pxPerMOverride,
-          ),
-        ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final shortSide = math.min(constraints.maxWidth, constraints.maxHeight);
+        final margin = shortSide * 0.025;
+        final primaryFont = shortSide * 0.067;
+        final secondaryFont = shortSide * 0.058;
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            // --- Map layer ---
+            CustomPaint(
+              painter: HudPainter(
+                displayConfig: displayConfig,
+                user: data.user,
+                headingDeg: data.heading,
+                routeGeometry: data.route,
+                roads: roads,
+                speedKmh: data.speedKmh,
+                routeColor: routeColor,
+                roadColor: roadColor,
+                pxPerMOverride: data.pxPerMOverride,
+              ),
+            ),
 
-        // --- Overlay trên-trái: mũi tên rẽ + khoảng cách tới điểm rẽ ---
-        Positioned(
-          top: 6,
-          left: 6,
-          child: _Panel(
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                ManeuverIcon(data.maneuver, size: 26, color: Colors.white),
-                const SizedBox(width: 6),
-                Text(
-                  UiFormat.distance(data.distanceToManeuverM),
-                  style: _overlayText(16, FontWeight.w700),
+            // --- Overlay trên-trái: mũi tên rẽ + khoảng cách tới điểm rẽ ---
+            Positioned(
+              top: margin,
+              left: margin,
+              child: _Panel(
+                shortSide: shortSide,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ManeuverIcon(
+                      data.maneuver,
+                      size: shortSide * 0.108,
+                      color: Colors.white,
+                    ),
+                    SizedBox(width: shortSide * 0.025),
+                    Text(
+                      UiFormat.distance(data.distanceToManeuverM),
+                      style: _overlayText(primaryFont, FontWeight.w700),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
-          ),
-        ),
 
-        // --- Overlay trên-phải: biển tốc độ giới hạn ---
-        if (data.speedLimitKmh > 0)
-          Positioned(
-            top: 6,
-            right: 6,
-            child: _SpeedLimitBadge(
-              limit: data.speedLimitKmh,
-              over: data.isOverSpeed,
-            ),
-          ),
+            // --- Overlay trên-phải: biển tốc độ giới hạn ---
+            if (data.speedLimitKmh > 0)
+              Positioned(
+                top: margin,
+                right: margin,
+                child: _SpeedLimitBadge(
+                  limit: data.speedLimitKmh,
+                  over: data.isOverSpeed,
+                  shortSide: shortSide,
+                ),
+              ),
 
-        // --- Overlay dưới-trái: tốc độ hiện tại ---
-        Positioned(
-          bottom: 6,
-          left: 6,
-          child: _Panel(
-            child: Text(
-              '${data.speedKmh.round()} km/h',
-              style: _overlayText(16, FontWeight.w700),
+            // --- Overlay dưới-trái: tốc độ hiện tại ---
+            Positioned(
+              bottom: margin,
+              left: margin,
+              child: _Panel(
+                shortSide: shortSide,
+                child: Text(
+                  '${data.speedKmh.round()} km/h',
+                  style: _overlayText(primaryFont, FontWeight.w700),
+                ),
+              ),
             ),
-          ),
-        ),
 
-        // --- Overlay dưới-phải: ETA · còn lại ---
-        Positioned(
-          bottom: 6,
-          right: 6,
-          child: _Panel(
-            child: Text(
-              '${UiFormat.eta(data.etaSeconds)} · '
-              '${UiFormat.distance(data.distanceRemainingM)}',
-              style: _overlayText(14, FontWeight.w600),
+            // --- Overlay dưới-phải: ETA · còn lại ---
+            Positioned(
+              bottom: margin,
+              right: margin,
+              child: _Panel(
+                shortSide: shortSide,
+                child: Text(
+                  '${UiFormat.eta(data.etaSeconds)} · '
+                  '${UiFormat.distance(data.distanceRemainingM)}',
+                  style: _overlayText(secondaryFont, FontWeight.w600),
+                ),
+              ),
             ),
-          ),
-        ),
 
-        // --- Chấm trạng thái BLE/GPS (giữa-trên) ---
-        Positioned(
-          top: 8,
-          left: 0,
-          right: 0,
-          child: Center(
-            child: _StatusDot(
-              ok: !data.gpsWeak,
-              label: data.isDemo
-                  ? 'DEMO'
-                  : (data.isBle ? 'BLE LIVE' : (data.gpsWeak ? 'GPS yếu' : 'GPS OK')),
-              color: data.isBle ? const Color(0xFF1A73E8) : null,
+            // --- Chấm trạng thái BLE/GPS (giữa-trên) ---
+            Positioned(
+              top: shortSide * 0.033,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: _StatusDot(
+                  ok: !data.gpsWeak,
+                  label: data.isDemo
+                      ? 'DEMO'
+                      : (data.isBle
+                            ? 'BLE LIVE'
+                            : (data.gpsWeak ? 'GPS yếu' : 'GPS OK')),
+                  color: data.isBle ? const Color(0xFF1A73E8) : null,
+                  shortSide: shortSide,
+                ),
+              ),
             ),
-          ),
-        ),
-      ],
+          ],
+        );
+      },
     );
   }
 
   static TextStyle _overlayText(double size, FontWeight weight) => TextStyle(
-        color: Colors.white,
-        fontSize: size,
-        fontWeight: weight,
-        shadows: const [Shadow(color: Colors.black, blurRadius: 2)],
-      );
+    color: Colors.white,
+    fontSize: size,
+    fontWeight: weight,
+    shadows: const [Shadow(color: Colors.black, blurRadius: 2)],
+  );
 }
 
 /// Panel bán trong suốt (giống widget LVGL nền mờ — §6).
 class _Panel extends StatelessWidget {
   final Widget child;
-  const _Panel({required this.child});
+  final double shortSide;
+  const _Panel({required this.child, required this.shortSide});
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      padding: EdgeInsets.symmetric(
+        horizontal: shortSide * 0.033,
+        vertical: shortSide * 0.021,
+      ),
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.45),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(shortSide * 0.033),
       ),
       child: child,
     );
@@ -492,24 +561,32 @@ class _Panel extends StatelessWidget {
 class _SpeedLimitBadge extends StatelessWidget {
   final int limit;
   final bool over;
-  const _SpeedLimitBadge({required this.limit, required this.over});
+  final double shortSide;
+  const _SpeedLimitBadge({
+    required this.limit,
+    required this.over,
+    required this.shortSide,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 40,
-      height: 40,
+      width: shortSide * 0.167,
+      height: shortSide * 0.167,
       alignment: Alignment.center,
       decoration: BoxDecoration(
         color: over ? const Color(0xFFD93025) : Colors.white,
         shape: BoxShape.circle,
-        border: Border.all(color: const Color(0xFFD93025), width: 4),
+        border: Border.all(
+          color: const Color(0xFFD93025),
+          width: shortSide * 0.017,
+        ),
       ),
       child: Text(
         '$limit',
         style: TextStyle(
           color: over ? Colors.white : Colors.black,
-          fontSize: 16,
+          fontSize: shortSide * 0.067,
           fontWeight: FontWeight.w800,
         ),
       ),
@@ -522,32 +599,39 @@ class _StatusDot extends StatelessWidget {
   final bool ok;
   final String label;
   final Color? color;
-  const _StatusDot({required this.ok, required this.label, this.color});
+  final double shortSide;
+  const _StatusDot({
+    required this.ok,
+    required this.label,
+    required this.shortSide,
+    this.color,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final dotColor = color ?? (ok ? const Color(0xFF34A853) : const Color(0xFFF9AB00));
+    final dotColor =
+        color ?? (ok ? const Color(0xFF34A853) : const Color(0xFFF9AB00));
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      padding: EdgeInsets.symmetric(
+        horizontal: shortSide * 0.033,
+        vertical: shortSide * 0.0125,
+      ),
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.45),
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(shortSide * 0.042),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 8,
-            height: 8,
-            decoration: BoxDecoration(
-              color: dotColor,
-              shape: BoxShape.circle,
-            ),
+            width: shortSide * 0.033,
+            height: shortSide * 0.033,
+            decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle),
           ),
-          const SizedBox(width: 5),
+          SizedBox(width: shortSide * 0.021),
           Text(
             label,
-            style: const TextStyle(color: Colors.white, fontSize: 11),
+            style: TextStyle(color: Colors.white, fontSize: shortSide * 0.046),
           ),
         ],
       ),

@@ -5,9 +5,8 @@ import '../../navigation/nav_controller.dart';
 import '../../providers/ble_providers.dart';
 import 'hud_painter.dart';
 
-/// Panel nhỏ hiển thị chính xác những gì ESP32 đang vẽ, dựa trên dữ liệu BLE
-/// đã được gửi (MAP_POSE + MAP_ROUTE + MAP_ROADS). Kích thước ~120×165px, tỉ lệ
-/// 240×320 như màn hình ESP32 thật.
+/// Panel nhỏ hiển thị chính xác những gì ESP32 đang vẽ. Kích thước và tỉ lệ
+/// lấy từ SYSTEM_INFO của thiết bị đã pair.
 ///
 /// Đặt vào Stack của NavigationScreen để xem live preview bên cạnh bản đồ chính.
 class EspPreviewPanel extends ConsumerWidget {
@@ -21,16 +20,26 @@ class EspPreviewPanel extends ConsumerWidget {
     // Dùng bearing live từ NavController (cập nhật mỗi GPS tick, kể cả đứng yên
     // hoặc vừa rẽ) thay vì heading từ BLE snapshot (chỉ cập nhật mỗi 5m) — để
     // preview xoay heading-up đồng bộ với bản đồ chính.
-    final liveBearing = ref.watch(navControllerProvider.select((s) => s.bearing));
+    final liveBearing = ref.watch(
+      navControllerProvider.select((s) => s.bearing),
+    );
     final routeColor = Theme.of(context).colorScheme.primary;
+    final displayConfig = ref.watch(hudDisplayConfigProvider);
+    final panelWidth = MediaQuery.sizeOf(context).shortestSide * 0.32;
 
     return Container(
-      width: 120,
+      width: panelWidth,
       decoration: BoxDecoration(
         color: Colors.black,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.white24, width: 1),
-        boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 10, offset: Offset(0, 4))],
+        boxShadow: const [
+          BoxShadow(
+            color: Colors.black54,
+            blurRadius: 10,
+            offset: Offset(0, 4),
+          ),
+        ],
       ),
       clipBehavior: Clip.hardEdge,
       child: Column(
@@ -38,10 +47,11 @@ class EspPreviewPanel extends ConsumerWidget {
         children: [
           _Header(hasData: snap.hasValue, onClose: onClose),
           AspectRatio(
-            aspectRatio: 240 / 320,
+            aspectRatio: displayConfig.aspectRatio,
             child: snap.when(
               data: (s) => CustomPaint(
                 painter: HudPainter(
+                  displayConfig: displayConfig,
                   user: s.user,
                   headingDeg: liveBearing,
                   routeGeometry: s.route,
@@ -50,15 +60,18 @@ class EspPreviewPanel extends ConsumerWidget {
                   routeColor: routeColor,
                   roadColor: const Color(0xFF8A8A8E),
                   // Dùng đúng zoom ESP32: px_per_m = SCR_W / viewSpanM.
-                  pxPerMOverride: 240.0 / s.viewSpanM.clamp(10, 5000),
+                  pxPerMOverride:
+                      displayConfig.screenW / s.viewSpanM.clamp(10, 5000),
                 ),
               ),
               loading: () => const _Placeholder(label: 'Chờ BLE...'),
-              error: (e, st) => const _Placeholder(label: 'Lỗi BLE', isError: true),
+              error: (e, st) =>
+                  const _Placeholder(label: 'Lỗi BLE', isError: true),
             ),
           ),
           snap.maybeWhen(
-            data: (s) => _Footer(speedKmh: s.speedKmh, navigating: s.navigating),
+            data: (s) =>
+                _Footer(speedKmh: s.speedKmh, navigating: s.navigating),
             orElse: () => const SizedBox.shrink(),
           ),
         ],
@@ -84,14 +97,21 @@ class _Header extends StatelessWidget {
             width: 6,
             height: 6,
             decoration: BoxDecoration(
-              color: hasData ? const Color(0xFF34A853) : const Color(0xFF5F6368),
+              color: hasData
+                  ? const Color(0xFF34A853)
+                  : const Color(0xFF5F6368),
               shape: BoxShape.circle,
             ),
           ),
           const SizedBox(width: 5),
           const Text(
             'ESP32',
-            style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.5),
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.5,
+            ),
           ),
           const Spacer(),
           GestureDetector(
@@ -135,7 +155,11 @@ class _Footer extends StatelessWidget {
               ),
               child: const Text(
                 'NAV',
-                style: TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w700),
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ),
         ],

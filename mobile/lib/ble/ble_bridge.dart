@@ -11,6 +11,8 @@
 // ── BẢNG MESSAGE chuẩn (§6.2) ───────────────────────────────────────────
 //   0x01 HELLO          App→Dev  proto_ver u8
 //   0x02 DEVICE_INFO    Dev→App  fw_ver u16, cap_bitmap u16, max_text u8
+//   0x03 SYSTEM_INFO    2 chiều  static product/display info; cache once per pair
+//   0x04 DEVICE_STATUS  2 chiều  battery/screen/pin/uptime/free heap snapshot
 //   0x10 NAV_INSTRUCTION App→Dev seq u8, maneuver u8, distance_m u16,
 //                                exit_number u8, name_len u8, street_name[]
 //   0x11 DISTANCE_TICK  App→Dev  dist_to_man u16(m), dist_remain u32(m),
@@ -137,6 +139,8 @@ const int _kMaxSingleWritePayload = _kPreferredWriteMax - _kFrameOverhead;
 
 const int _typeHello = 0x01;
 const int _typeDeviceInfo = 0x02;
+const int _typeSystemInfo = 0x03;
+const int _typeDeviceStatus = 0x04;
 const int _typeNavInstruction = 0x10;
 const int _typeDistanceTick = 0x11;
 const int _typeSpeedLimit = 0x12;
@@ -175,6 +179,8 @@ const int _kMapRoadsMaxPayload = _kMaxSingleWritePayload;
 const double _kSimplifyEpsM = 2.5;
 
 const int _protoVer = 1;
+const int _systemInfoSchema = 1;
+const int _deviceStatusSchema = 1;
 const List<int> _kReconnectBackoffSec = [3, 6, 12, 24, 30];
 
 // Stop-and-wait ACK: timeout mỗi frame, số lần retry tối đa trước khi drop.
@@ -192,10 +198,17 @@ class ButtonEvent {
   const ButtonEvent(this.name, this.value);
 }
 
+abstract interface class BleSystemInfoStore {
+  DeviceSystemInfo? read(String deviceId);
+  Future<void> write(String deviceId, DeviceSystemInfo info);
+  Future<void> remove(String deviceId);
+}
+
 /// Cầu nối BLE: encode NavEvent → frame, deframe RX, quản trạng thái/reconnect.
 class BleBridge {
   final IBleTransport _transport;
   final NavEventBus _bus;
+  final BleSystemInfoStore? systemInfoStore;
 
   // ── Cấu hình runtime (đồng bộ từ settings qua provider) ──────────────
   /// Gửi tên đường đầy đủ; false → rút gọn/để trống cho màn nhỏ (§11.8).
@@ -223,6 +236,7 @@ class BleBridge {
   // ── Timer ────────────────────────────────────────────────────────────
   Timer? _heartbeat;
   Timer? _clockSync;
+  Timer? _statusPoll;
   Timer? _reconnect;
   int _reconnectAttempt = 0;
   bool _disposed = false;
@@ -261,7 +275,7 @@ class BleBridge {
   bool _navigating = false;
   bool _offRoute = false;
 
-  BleBridge(this._transport, this._bus) {
+  BleBridge(this._transport, this._bus, {this.systemInfoStore}) {
     _busSub = _bus.stream.listen(_onNavEvent);
   }
 
@@ -288,10 +302,12 @@ class BleBridge {
     try {
       _intentionalDisconnect = false;
       _cancelReconnect();
+      final cachedSystemInfo = systemInfoStore?.read(device.id);
       _setStatus(
-        _status.copyWith(
+        BleStatus(
           state: BleConnectionState.connecting,
           device: device,
+          systemInfo: cachedSystemInfo,
           reconnectInSeconds: 0,
         ),
       );
@@ -327,9 +343,14 @@ class BleBridge {
 
       // Handshake: gửi HELLO, chờ DEVICE_INFO (dispatch sẽ cập nhật status.info).
       _enqueue(_typeHello, [_protoVer], withResponse: true, coalesce: false);
+      if (cachedSystemInfo == null) {
+        _requestSystemInfo();
+      }
+      _requestDeviceStatus();
 
       _startHeartbeat();
       _startClockSync();
+      _startStatusPoll();
       unawaited(_refreshRssi());
 
       // Nối lại → bắn full snapshot để HUD đồng bộ ngay (§5.3).
@@ -345,6 +366,7 @@ class BleBridge {
     _cancelReconnect();
     _stopHeartbeat();
     _stopClockSync();
+    _stopStatusPoll();
     _queue.clear();
     unawaited(_transport.disconnect());
     _setStatus(
@@ -356,7 +378,11 @@ class BleBridge {
   }
 
   void forget() {
+    final deviceId = _status.device?.id;
     disconnect();
+    if (deviceId != null) {
+      unawaited(systemInfoStore?.remove(deviceId));
+    }
     _lastInstructionFrame = null;
     _lastDistanceTickFrame = null;
     _lastSpeedLimitFrame = null;
@@ -404,6 +430,7 @@ class BleBridge {
     required int speedKmh,
     required double viewSpanM,
   }) {
+    if (!_supportsGraphicalMap) return;
     _lastPose = GeoPoint(lat, lng);
     final flags = _poseFlags();
     final b = BytesBuilder();
@@ -465,6 +492,7 @@ class BleBridge {
     required List<RoadSegment> roads,
     required double routeProgressM,
   }) async {
+    if (!_supportsGraphicalMap) return;
     final anchor =
         _lastPose ?? (routeGeometry.isNotEmpty ? routeGeometry.first : null);
     if (anchor == null) {
@@ -545,6 +573,7 @@ class BleBridge {
     _connSub?.cancel();
     _stopHeartbeat();
     _stopClockSync();
+    _stopStatusPoll();
     _cancelReconnect();
     _statusCtrl.close();
     _btnCtrl.close();
@@ -571,7 +600,8 @@ class BleBridge {
         _lastInstructionFrame = frame;
         // Chỉ gửi khi mũi tên / tên đường thực sự đổi; distance_to_man
         // thay đổi liên tục nhưng đã có DISTANCE_TICK riêng — không cần resend.
-        final sameArrow = mWire == _lastSentManeuverWire &&
+        final sameArrow =
+            mWire == _lastSentManeuverWire &&
             exitNum == _lastSentExitNumber &&
             m.streetName == _lastSentManeuverStreet;
         if (!sameArrow) {
@@ -687,7 +717,17 @@ class BleBridge {
         forceStripDiacritics || (info != null && !info.supportsDiacritics);
     if (needStrip) text = _stripDiacritics(text);
 
-    final maxText = info?.maxText ?? DeviceInfo.defaultMaxText;
+    var maxText = info?.maxText ?? DeviceInfo.defaultMaxText;
+    final systemInfo = _status.systemInfo;
+    if (systemInfo != null) {
+      if (!systemInfo.supportsScreen) {
+        maxText = 0;
+      } else if (systemInfo.screenType == HudScreenType.mono) {
+        maxText = math.min(maxText, 16);
+      } else if (systemInfo.screenWidth > 0) {
+        maxText = math.min(maxText, math.max(8, systemInfo.screenWidth ~/ 6));
+      }
+    }
     var bytes = utf8.encode(text);
     if (bytes.length > maxText) {
       // Cắt UTF-8 an toàn (không cắt giữa 1 ký tự nhiều byte).
@@ -713,6 +753,12 @@ class BleBridge {
       }
     }
     return buf.toString();
+  }
+
+  bool get _supportsGraphicalMap {
+    final info = _status.systemInfo;
+    if (info == null) return true;
+    return HudDisplayConfig.fromSystemInfo(info).supportsGraphicalMap;
   }
 
   // ── MAP_* — chiếu equirectangular north-up (§6.2.1, v0.3) ─────────────
@@ -1109,10 +1155,7 @@ class BleBridge {
 
   int get _maxWriteLen => math.max(20, _transport.mtu - 3);
 
-  Future<void> _writeChunks(
-    Uint8List data, {
-    required int maxWriteLen,
-  }) async {
+  Future<void> _writeChunks(Uint8List data, {required int maxWriteLen}) async {
     for (var offset = 0; offset < data.length; offset += maxWriteLen) {
       final end = math.min(offset + maxWriteLen, data.length);
       // withResponse: true để BLE layer ACK từng chunk trước khi gửi tiếp — tránh
@@ -1147,6 +1190,10 @@ class BleBridge {
     switch (type) {
       case _typeDeviceInfo:
         _handleDeviceInfo(payload);
+      case _typeSystemInfo:
+        _handleSystemInfo(payload);
+      case _typeDeviceStatus:
+        _handleDeviceStatus(payload);
       case _typeAck:
         if (payload.length >= 2) {
           final ackedType = payload[0];
@@ -1183,6 +1230,69 @@ class BleBridge {
     _setStatus(_status.copyWith(info: info));
   }
 
+  void _handleSystemInfo(Uint8List p) {
+    const fixedLength = 28;
+    if (p.length < fixedLength || p[0] != _systemInfoSchema) return;
+
+    final dateLength = p[25];
+    final serialLength = p[26];
+    final mcuLength = p[27];
+    final expectedLength = fixedLength + dateLength + serialLength + mcuLength;
+    if (p.length < expectedLength) return;
+
+    var offset = fixedLength;
+    String readText(int length) {
+      final value = utf8.decode(
+        Uint8List.sublistView(p, offset, offset + length),
+        allowMalformed: true,
+      );
+      offset += length;
+      return value;
+    }
+
+    final info = DeviceSystemInfo(
+      vendorId: _readU32(p, 1),
+      modelId: _readU32(p, 5),
+      productId: _readU32(p, 9),
+      hardwareVersion: _readU32(p, 13),
+      supportsBattery: p[17] != 0,
+      supportsScreen: p[18] != 0,
+      screenType: HudScreenType.fromWire(p[19]),
+      screenWidth: _readU16(p, 21),
+      screenHeight: _readU16(p, 23),
+      manufacturerDate: readText(dateLength),
+      serialNumber: readText(serialLength),
+      mcuDescription: readText(mcuLength),
+    );
+
+    _setStatus(_status.copyWith(systemInfo: info));
+    final deviceId = _status.device?.id;
+    if (deviceId != null) {
+      unawaited(systemInfoStore?.write(deviceId, info));
+    }
+  }
+
+  void _handleDeviceStatus(Uint8List p) {
+    if (p.length < 20 || p[0] != _deviceStatusSchema) return;
+
+    final batteryRaw = p[3];
+    final supplyRaw = _readU16(p, 4);
+    final temperatureRaw = _readI16(p, 6);
+    final status = DeviceStatus(
+      flags: _readU16(p, 1),
+      batteryPercent: batteryRaw == 0xFF ? null : batteryRaw.clamp(0, 100),
+      supplyMillivolts: supplyRaw == 0 ? null : supplyRaw,
+      temperatureCelsius: temperatureRaw == -0x8000
+          ? null
+          : temperatureRaw / 10.0,
+      pinState: _readU32(p, 8),
+      uptime: Duration(seconds: _readU32(p, 12)),
+      freeHeapBytes: _readU32(p, 16),
+      receivedAt: DateTime.now(),
+    );
+    _setStatus(_status.copyWith(deviceStatus: status));
+  }
+
   String _buttonName(int btn, int action) {
     // Map đơn giản btn → tên dễ đọc (firmware có thể định nghĩa khác).
     switch (btn) {
@@ -1215,6 +1325,27 @@ class BleBridge {
   void _stopHeartbeat() {
     _heartbeat?.cancel();
     _heartbeat = null;
+  }
+
+  void _startStatusPoll() {
+    _stopStatusPoll();
+    _statusPoll = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => _requestDeviceStatus(),
+    );
+  }
+
+  void _stopStatusPoll() {
+    _statusPoll?.cancel();
+    _statusPoll = null;
+  }
+
+  void _requestSystemInfo() {
+    _enqueue(_typeSystemInfo, const [], coalesce: true);
+  }
+
+  void _requestDeviceStatus() {
+    _enqueue(_typeDeviceStatus, const [], coalesce: true);
   }
 
   // ── Clock sync (MAP_CLOCK 0x33) ──────────────────────────────────────
@@ -1259,6 +1390,7 @@ class BleBridge {
     _connectedAt = null;
     _stopHeartbeat();
     _stopClockSync();
+    _stopStatusPoll();
     _queue.clear();
     // Giải phóng bất kỳ ACK đang chờ để _drain không bị treo.
     final pendingAck = _ackCompleter;
@@ -1358,6 +1490,20 @@ class BleBridge {
     b.addByte((u >> 16) & 0xFF);
     b.addByte((u >> 24) & 0xFF);
   }
+
+  static int _readU16(Uint8List data, int offset) =>
+      data[offset] | (data[offset + 1] << 8);
+
+  static int _readI16(Uint8List data, int offset) {
+    final value = _readU16(data, offset);
+    return value & 0x8000 == 0 ? value : value - 0x10000;
+  }
+
+  static int _readU32(Uint8List data, int offset) =>
+      data[offset] |
+      (data[offset + 1] << 8) |
+      (data[offset + 2] << 16) |
+      (data[offset + 3] << 24);
 }
 
 /// Một item trong Tx queue.

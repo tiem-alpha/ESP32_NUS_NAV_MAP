@@ -265,7 +265,7 @@ Vòng lặp xử lý mỗi GPS fix (1 Hz):
 2. Connect → request **MTU 247** (Android; iOS tự negotiate ~185). Lưu MTU thực tế để codec quyết định fragment.
 3. Request connection priority HIGH khi đang navigate (Android `CONNECTION_PRIORITY_HIGH`, interval ~11.25–15 ms); hạ về BALANCED khi idle để tiết kiệm pin thiết bị.
 4. Discover service, enable notify trên TX char.
-5. Handshake: app gửi `HELLO`, thiết bị trả `DEVICE_INFO` (fw version, screen size, capability bitmap) → app điều chỉnh nội dung gửi (vd màn 128×32 thì rút gọn street name).
+5. Handshake: app gửi `HELLO`, thiết bị trả `DEVICE_INFO` (fw version + capability bitmap). Nếu BLE ID chưa có cache sau khi pair, app request `SYSTEM_INFO` đúng một lần rồi lưu local; mọi lần reconnect sau dùng cache này để biết loại/kích thước màn hình. `DEVICE_STATUS` là dữ liệu động nên được request khi kết nối và refresh định kỳ.
 6. Bonding: optional (NUS thường không yêu cầu); nếu sản phẩm thật nên bật LE Secure Connections + whitelist để chống thiết bị lạ ghi đè.
 
 ### 5.3 Chính sách truyền & độ tin cậy
@@ -299,6 +299,9 @@ NUS chỉ là "ống UART" — cần định nghĩa framing + message. Thiết k
 |---|---|---|---|---|
 | 0x01 | HELLO | App→Dev | 1 lần | proto_ver u8 |
 | 0x02 | DEVICE_INFO | Dev→App | trả lời HELLO | fw_ver u16, cap_bitmap u16, max_text u8 |
+| 0x03 | SYSTEM_INFO | 2 chiều | request một lần khi pair | App→Dev payload rỗng; Dev→App schema u8, vendor/model/product/hardware u32, battery/screen flags, screen_type, screen_w/h và 3 chuỗi length-prefixed |
+| 0x04 | DEVICE_STATUS | 2 chiều | khi connect + mỗi 15 s | App→Dev payload rỗng; Dev→App flags, battery, voltage, temperature, pin_state, uptime, free_heap |
+| 0x05 | DEVICE_CONFIG | App→Dev | khi đổi cấu hình | reserved: sleep, brightness, zoom, theme, font |
 | 0x10 | NAV_INSTRUCTION | App→Dev | khi đổi maneuver | xem §6.3 |
 | 0x11 | DISTANCE_TICK | App→Dev | 1 Hz | dist_to_man u16 (m), dist_remain u32 (m), eta u16 (min), speed u8 (km/h) |
 | 0x12 | SPEED_LIMIT | App→Dev | khi đổi | limit u8 (km/h, 0=unknown), is_over u8 |
@@ -313,7 +316,7 @@ NUS chỉ là "ống UART" — cần định nghĩa framing + message. Thiết k
 
 > **Phiên bản 0.3 — thiết kế lại cho HUD full-screen.** Bỏ mô hình "mini-map + map center = MAP_POSITION gần nhất". Thiết bị OLED 1 dòng có thể bỏ qua nhóm này.
 
-**Mô hình hiển thị (chốt):** ESP32 vẽ **bản đồ chiếm toàn bộ 240×320**, thông tin dẫn đường (mũi tên rẽ + khoảng cách, tốc độ, ETA, biển báo, trạng thái BLE/GPS) là **overlay bán trong suốt** vẽ ĐÈ lên map (dữ liệu overlay lấy từ §6.2/§6.3: NAV_INSTRUCTION/DISTANCE_TICK/SPEED_LIMIT/NAV_STATE — không lặp lại trong nhóm map).
+**Mô hình hiển thị (chốt):** ESP32 vẽ bản đồ chiếm toàn bộ `screen_w × screen_h` khai báo trong `SYSTEM_INFO`; mọi kích thước/vị trí overlay tính theo tỉ lệ màn hình, không hardcode theo 240×320. Thông tin dẫn đường là overlay bán trong suốt vẽ đè lên map.
 
 **Ai chiếu toạ độ:** **ESP32 tự chiếu** (app không biết kích thước màn HUD). App chỉ gửi hình học ở hệ **mét địa lý north-up** quanh một điểm *anchor* tuyệt đối; ESP32 mỗi khung tự: (1) dịch theo `live_pose − anchor`, (2) **xoay −heading** (heading-up), (3) scale theo `view_span_dm` (xem dưới), (4) đặt user ở **giữa-dưới** màn. Vì offset là north-up nên **đổi heading KHÔNG cần gửi lại** route/roads — chỉ MAP_POSE đổi.
 

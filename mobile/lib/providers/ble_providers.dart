@@ -2,11 +2,46 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../ble/ble_bridge.dart';
 import '../models/ble_device.dart';
 import 'app_providers.dart';
 import 'ui_providers.dart';
+
+class SharedPrefsBleSystemInfoStore implements BleSystemInfoStore {
+  static const _prefix = 'paired_ble_system_info.';
+  final SharedPreferences _prefs;
+
+  SharedPrefsBleSystemInfoStore(this._prefs);
+
+  String _key(String deviceId) => '$_prefix${Uri.encodeComponent(deviceId)}';
+
+  @override
+  DeviceSystemInfo? read(String deviceId) {
+    final raw = _prefs.getString(_key(deviceId));
+    if (raw == null) return null;
+    try {
+      return DeviceSystemInfo.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Future<void> write(String deviceId, DeviceSystemInfo info) async {
+    await _prefs.setString(_key(deviceId), jsonEncode(info.toJson()));
+  }
+
+  @override
+  Future<void> remove(String deviceId) async {
+    await _prefs.remove(_key(deviceId));
+  }
+}
+
+final bleSystemInfoStoreProvider = Provider<BleSystemInfoStore>((ref) {
+  return SharedPrefsBleSystemInfoStore(ref.watch(sharedPrefsProvider));
+});
 
 class BleScanState {
   final List<DiscoveredDevice> devices;
@@ -127,6 +162,7 @@ final bleBridgeProvider = Provider<BleBridge>((ref) {
   final bridge = BleBridge(
     ref.watch(bleTransportProvider),
     ref.watch(navEventBusProvider),
+    systemInfoStore: ref.watch(bleSystemInfoStoreProvider),
   );
   var autoConnectStarted = false;
 
@@ -165,6 +201,16 @@ final bleStatusProvider = StreamProvider<BleStatus>((ref) {
 final bleStatusValueProvider = Provider<BleStatus>((ref) {
   final bridge = ref.watch(bleBridgeProvider);
   return ref.watch(bleStatusProvider).value ?? bridge.currentStatus;
+});
+
+/// Cấu hình màn hình hiệu lực: ưu tiên dữ liệu live, sau đó cache của thiết bị pair.
+final hudDisplayConfigProvider = Provider<HudDisplayConfig>((ref) {
+  final status = ref.watch(bleStatusValueProvider);
+  final paired = ref.watch(pairedBleDeviceProvider);
+  final store = ref.watch(bleSystemInfoStoreProvider);
+  final liveInfo = status.device?.id == paired?.id ? status.systemInfo : null;
+  final cachedInfo = paired == null ? null : store.read(paired.id);
+  return HudDisplayConfig.fromSystemInfo(liveInfo ?? cachedInfo);
 });
 
 /// Kết quả scan NUS (S5 scan list). Chỉ scan khi người dùng bấm nút Quét.

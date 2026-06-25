@@ -8,15 +8,15 @@
 
 #include "map_model.h"
 #include "nav_proto.h"
-
+#include "model.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define SCR_W   240
-#define SCR_H   320
-#define USER_X  120  /* user neo giữa ngang */
-#define USER_Y  230  /* ... và lệch xuống dưới để nhìn xa phía trước */
+#define SCR_W   SCREEN_W
+#define SCR_H   SCREEN_H
+#define USER_X  (SCR_W/2)  /* user neo giữa ngang */
+#define USER_Y  ((SCR_H/4)*3)  /* ... và lệch xuống dưới để nhìn xa phía trước */
 
 typedef struct { int16_t x, y; } scr_pt_t;
 

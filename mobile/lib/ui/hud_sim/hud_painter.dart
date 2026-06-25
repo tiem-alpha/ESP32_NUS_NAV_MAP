@@ -2,54 +2,24 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../../models/ble_device.dart';
 import '../../models/geo_point.dart';
 import '../../models/road_segment.dart';
 
-/// Khung tham chiếu của HUD ESP32 (240×320, §6–§7 DESIGN.md).
-class HudFrame {
-  HudFrame._();
-
-  /// Kích thước logic của màn HUD (px thiết bị).
-  static const double width = 240;
-  static const double height = 320;
-
-  /// User neo giữa-dưới (§7): nhìn xa phía trước khi heading-up.
-  static const double userX = 120;
-  static const double userY = 230;
-}
-
-/// `CustomPainter` mô phỏng **chính xác** view full-screen của HUD ESP32:
-/// chiếu route/roads từ GeoPoint sang pixel theo đúng phép toán firmware
-/// (`projection.h` / DESIGN §7), heading-up, user neo giữa-dưới.
-///
-/// Toạ độ vẽ luôn quy về khung 240×320 rồi scale ([scale]) ra kích thước widget.
+/// Vẽ mô phỏng HUD theo đúng kích thước và tỉ lệ nhận từ SYSTEM_INFO.
 class HudPainter extends CustomPainter {
-  /// Vị trí user hiện tại — dùng làm **anchor** cho phép chiếu.
+  final HudDisplayConfig displayConfig;
   final GeoPoint user;
-
-  /// Hướng đầu xe (độ, bắc = 0) — heading-up sẽ quay -heading.
   final double headingDeg;
-
-  /// Hình học tuyến (polyline) — vẽ xanh, đậm.
   final List<GeoPoint> routeGeometry;
-
-  /// Đường xung quanh — vẽ xám, độ dày theo HighwayType.
   final List<RoadSegment> roads;
-
-  /// Tốc độ (km/h) — dùng auto-zoom (đi nhanh → nhìn xa hơn).
   final double speedKmh;
-
-  /// Màu route (theo theme primary).
   final Color routeColor;
-
-  /// Màu đường nền (theo theme).
   final Color roadColor;
-
-  /// Override px/m thay vì tính từ speed — dùng khi có viewSpanM từ MAP_POSE
-  /// để khớp chính xác zoom ESP32 (`HudFrame.width / viewSpanM`).
   final double? pxPerMOverride;
 
   HudPainter({
+    required this.displayConfig,
     required this.user,
     required this.headingDeg,
     required this.routeGeometry,
@@ -60,157 +30,149 @@ class HudPainter extends CustomPainter {
     this.pxPerMOverride,
   });
 
-  /// px/mét tại khung 240×320. Nếu có override (từ viewSpanM của MAP_POSE) dùng
-  /// đúng zoom ESP32; ngược lại tính từ speed (đứng yên gần, chạy nhanh xa).
   double get _pxPerM {
     if (pxPerMOverride != null) return pxPerMOverride!;
-    // 0..80 km/h → 0,9..0,35 px/m (nội suy tuyến tính, kẹp biên).
-    final t = (speedKmh.clamp(0, 80)) / 80.0;
+    final t = speedKmh.clamp(0, 80) / 80.0;
     return 0.9 - 0.55 * t;
   }
 
+  double get _shortSide => math.min(
+    displayConfig.screenW.toDouble(),
+    displayConfig.screenH.toDouble(),
+  );
+
+  double _ratio(double value) => _shortSide * value;
+
   @override
   void paint(Canvas canvas, Size size) {
-    // Scale từ khung 240×320 ra kích thước widget (giữ tỉ lệ).
-    final scale = math.min(size.width / HudFrame.width, size.height / HudFrame.height);
+    final frameWidth = displayConfig.screenW.toDouble();
+    final frameHeight = displayConfig.screenH.toDouble();
+    final scale = math.min(size.width / frameWidth, size.height / frameHeight);
     canvas.save();
     canvas.scale(scale);
 
-    // Nền bản đồ (tối, giống canvas LVGL).
-    final bg = Paint()..color = const Color(0xFF1B1B1F);
     canvas.drawRect(
-      const Rect.fromLTWH(0, 0, HudFrame.width, HudFrame.height),
-      bg,
+      Rect.fromLTWH(0, 0, frameWidth, frameHeight),
+      Paint()..color = const Color(0xFF1B1B1F),
     );
-    // Clip mọi nét vẽ vào đúng khung HUD.
-    canvas.clipRect(
-      const Rect.fromLTWH(0, 0, HudFrame.width, HudFrame.height),
-    );
+    canvas.clipRect(Rect.fromLTWH(0, 0, frameWidth, frameHeight));
 
-    final h = headingDeg * math.pi / 180.0;
-    final sinH = math.sin(h);
-    final cosH = math.cos(h);
+    final headingRad = headingDeg * math.pi / 180.0;
+    final sinH = math.sin(headingRad);
+    final cosH = math.cos(headingRad);
     final cosLat = math.cos(user.lat * math.pi / 180.0);
     final pxPerM = _pxPerM;
 
-    // --- Roads (xám, độ dày theo class) ---
-    for (final seg in roads) {
-      final paint = Paint()
-        ..color = roadColor
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round
-        ..strokeWidth = _roadWidth(seg.type);
-      final path = _projectPath(seg.points, sinH, cosH, cosLat, pxPerM);
-      if (path != null) canvas.drawPath(path, paint);
+    for (final segment in roads) {
+      final path = _projectPath(segment.points, sinH, cosH, cosLat, pxPerM);
+      if (path == null) continue;
+      canvas.drawPath(
+        path,
+        Paint()
+          ..color = roadColor
+          ..style = PaintingStyle.stroke
+          ..strokeCap = StrokeCap.round
+          ..strokeJoin = StrokeJoin.round
+          ..strokeWidth = _roadWidth(segment.type),
+      );
     }
 
-    // --- Route (xanh, dày ~6 px) ---
     if (routeGeometry.length >= 2) {
-      // Viền tối phía sau cho dễ phân biệt với roads.
-      final outline = Paint()
-        ..color = Colors.black.withValues(alpha: 0.5)
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round
-        ..strokeWidth = 9;
-      final routePaint = Paint()
-        ..color = routeColor
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round
-        ..strokeWidth = 6;
       final path = _projectPath(routeGeometry, sinH, cosH, cosLat, pxPerM);
       if (path != null) {
-        canvas.drawPath(path, outline);
-        canvas.drawPath(path, routePaint);
+        canvas.drawPath(
+          path,
+          Paint()
+            ..color = Colors.black.withValues(alpha: 0.5)
+            ..style = PaintingStyle.stroke
+            ..strokeCap = StrokeCap.round
+            ..strokeJoin = StrokeJoin.round
+            ..strokeWidth = _ratio(0.0375),
+        );
+        canvas.drawPath(
+          path,
+          Paint()
+            ..color = routeColor
+            ..style = PaintingStyle.stroke
+            ..strokeCap = StrokeCap.round
+            ..strokeJoin = StrokeJoin.round
+            ..strokeWidth = _ratio(0.025),
+        );
       }
     }
 
-    // --- User: mũi tên trắng tại (USER_X, USER_Y) hướng lên (heading-up) ---
     _drawUserArrow(canvas);
-
     canvas.restore();
   }
 
-  /// Chiếu danh sách GeoPoint → Path pixel (khung 240×320). Trả null nếu < 2 điểm.
   Path? _projectPath(
-    List<GeoPoint> pts,
+    List<GeoPoint> points,
     double sinH,
     double cosH,
     double cosLat,
     double pxPerM,
   ) {
-    if (pts.length < 2) return null;
+    if (points.length < 2) return null;
     final path = Path();
-    var started = false;
-    for (final p in pts) {
-      final o = _project(p, sinH, cosH, cosLat, pxPerM);
-      if (!started) {
-        path.moveTo(o.dx, o.dy);
-        started = true;
+    for (var i = 0; i < points.length; i++) {
+      final point = _project(points[i], sinH, cosH, cosLat, pxPerM);
+      if (i == 0) {
+        path.moveTo(point.dx, point.dy);
       } else {
-        path.lineTo(o.dx, o.dy);
+        path.lineTo(point.dx, point.dy);
       }
     }
     return path;
   }
 
-  /// Phép chiếu lõi — khớp CHÍNH XÁC firmware projection.c:
-  ///   xr = east·cosH - north·sinH   (giống: de*cos_h - dn*sin_h)
-  ///   yr = east·sinH + north·cosH   (giống: de*sin_h + dn*cos_h)
-  ///   x = USER_X + xr·pxPerM ; y = USER_Y - yr·pxPerM
   Offset _project(
-    GeoPoint p,
+    GeoPoint point,
     double sinH,
     double cosH,
     double cosLat,
     double pxPerM,
   ) {
-    final eastM = (p.lng - user.lng) * cosLat * 111320.0;
-    final northM = (p.lat - user.lat) * 111320.0;
-    final xr = eastM * cosH - northM * sinH;
-    final yr = eastM * sinH + northM * cosH;
-    final x = HudFrame.userX + xr * pxPerM;
-    final y = HudFrame.userY - yr * pxPerM;
-    return Offset(x, y);
+    final eastM = (point.lng - user.lng) * cosLat * 111320.0;
+    final northM = (point.lat - user.lat) * 111320.0;
+    final rotatedX = eastM * cosH - northM * sinH;
+    final rotatedY = eastM * sinH + northM * cosH;
+    return Offset(
+      displayConfig.userX + rotatedX * pxPerM,
+      displayConfig.userY - rotatedY * pxPerM,
+    );
   }
 
-  /// Độ dày road theo class (đường lớn dày hơn — §8).
   double _roadWidth(HighwayType type) {
-    switch (type) {
-      case HighwayType.motorway:
-      case HighwayType.trunk:
-        return 5;
-      case HighwayType.primary:
-        return 4;
-      case HighwayType.secondary:
-        return 3;
-      case HighwayType.tertiary:
-        return 2.5;
-      case HighwayType.residential:
-        return 2;
-      case HighwayType.service:
-        return 1.5;
-    }
+    return switch (type) {
+      HighwayType.motorway || HighwayType.trunk => _ratio(0.021),
+      HighwayType.primary => _ratio(0.017),
+      HighwayType.secondary => _ratio(0.013),
+      HighwayType.tertiary => _ratio(0.0105),
+      HighwayType.residential => _ratio(0.0085),
+      HighwayType.service => _ratio(0.0065),
+    };
   }
 
-  /// Mũi tên user trắng, viền tối, đỉnh hướng lên (heading-up).
   void _drawUserArrow(Canvas canvas) {
-    const cx = HudFrame.userX;
-    const cy = HudFrame.userY;
+    final centerX = displayConfig.userX;
+    final centerY = displayConfig.userY;
+    final tip = _ratio(0.058);
+    final halfWidth = _ratio(0.042);
+    final tail = _ratio(0.042);
+    final indent = _ratio(0.017);
     final path = Path()
-      ..moveTo(cx, cy - 14) // đỉnh
-      ..lineTo(cx - 10, cy + 10) // đáy trái
-      ..lineTo(cx, cy + 4) // hõm giữa
-      ..lineTo(cx + 10, cy + 10) // đáy phải
+      ..moveTo(centerX, centerY - tip)
+      ..lineTo(centerX - halfWidth, centerY + tail)
+      ..lineTo(centerX, centerY + indent)
+      ..lineTo(centerX + halfWidth, centerY + tail)
       ..close();
+
     canvas.drawPath(
       path,
       Paint()
         ..color = Colors.black.withValues(alpha: 0.6)
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 3
+        ..strokeWidth = _ratio(0.0125)
         ..strokeJoin = StrokeJoin.round,
     );
     canvas.drawPath(path, Paint()..color = Colors.white);
@@ -218,7 +180,10 @@ class HudPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant HudPainter old) {
-    return old.user != user ||
+    return old.displayConfig.screenW != displayConfig.screenW ||
+        old.displayConfig.screenH != displayConfig.screenH ||
+        old.displayConfig.screenType != displayConfig.screenType ||
+        old.user != user ||
         old.headingDeg != headingDeg ||
         old.routeGeometry != routeGeometry ||
         old.roads != roads ||

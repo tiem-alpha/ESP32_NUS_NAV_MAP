@@ -1,37 +1,80 @@
-/// Display configuration for a specific HUD model (screen + mini-map area).
+enum HudScreenType {
+  none(0),
+  mono(1),
+  rgb565(2),
+  rgb888(3);
+
+  final int wire;
+  const HudScreenType(this.wire);
+
+  static HudScreenType fromWire(int value) => values.firstWhere(
+    (type) => type.wire == value,
+    orElse: () => HudScreenType.none,
+  );
+
+  String get label => switch (this) {
+    HudScreenType.none => 'No display',
+    HudScreenType.mono => 'Mono',
+    HudScreenType.rgb565 => 'RGB565',
+    HudScreenType.rgb888 => 'RGB888',
+  };
+}
+
+/// Cấu hình màn hình lấy trực tiếp từ SYSTEM_INFO, không suy ra bằng model ID.
 class HudDisplayConfig {
   final int screenW;
   final int screenH;
-  final int mapW;
-  final int mapH;
+  final HudScreenType screenType;
+  final bool supported;
 
   const HudDisplayConfig({
     required this.screenW,
     required this.screenH,
-    required this.mapW,
-    required this.mapH,
+    required this.screenType,
+    required this.supported,
   });
+
+  static const fallback = HudDisplayConfig(
+    screenW: 240,
+    screenH: 320,
+    screenType: HudScreenType.rgb565,
+    supported: true,
+  );
+
+  factory HudDisplayConfig.fromSystemInfo(DeviceSystemInfo? info) {
+    if (info == null) {
+      return fallback;
+    }
+    if (!info.supportsScreen ||
+        info.screenWidth <= 0 ||
+        info.screenHeight <= 0) {
+      return HudDisplayConfig(
+        screenW: fallback.screenW,
+        screenH: fallback.screenH,
+        screenType: info.screenType,
+        supported: false,
+      );
+    }
+    return HudDisplayConfig(
+      screenW: info.screenWidth,
+      screenH: info.screenHeight,
+      screenType: info.screenType,
+      supported: info.supportsScreen,
+    );
+  }
+
+  double get aspectRatio => screenW / screenH;
+  double get userX => screenW * 0.5;
+  double get userY => screenH * 0.75;
+  bool get supportsGraphicalMap =>
+      supported &&
+      (screenType == HudScreenType.rgb565 ||
+          screenType == HudScreenType.rgb888);
 }
 
-const _hudDisplayConfigs = <int, HudDisplayConfig>{
-  0x0001: HudDisplayConfig(screenW: 240, screenH: 320, mapW: 240, mapH: 180),
-  0x0002: HudDisplayConfig(screenW: 320, screenH: 240, mapW: 200, mapH: 160),
-};
-
-const _defaultHudConfig = HudDisplayConfig(
-  screenW: 240,
-  screenH: 320,
-  mapW: 240,
-  mapH: 180,
-);
-
-/// Look up display config by model ID; falls back to default 240×320/240×180.
-HudDisplayConfig hudConfigForModel(int modelId) =>
-    _hudDisplayConfigs[modelId] ?? _defaultHudConfig;
-
-/// Thiết bị HUD quét được (scan list S5).
+/// Thiết bị HUD quét được.
 class DiscoveredDevice {
-  final String id; // remoteId / MAC / UUID tuỳ nền
+  final String id;
   final String name;
   final int rssi;
 
@@ -52,30 +95,16 @@ class DiscoveredDevice {
   Map<String, dynamic> toJson() => {'id': id, 'name': name, 'rssi': rssi};
 }
 
-/// Trạng thái kết nối BLE (4 trạng thái chip §11.3).
-enum BleConnectionState {
-  /// Xám — chưa ghép thiết bị nào.
-  unpaired,
+enum BleConnectionState { unpaired, connecting, connected, disconnected }
 
-  /// Vàng nhấp nháy — đang scan/connect/handshake.
-  connecting,
-
-  /// Xanh — đã kết nối + handshake xong.
-  connected,
-
-  /// Đỏ — mất kết nối (đang auto-reconnect backoff).
-  disconnected,
-}
-
-/// Thông tin thiết bị trả về từ DEVICE_INFO (CMD 0x04).
+/// Handshake ngắn, tương thích DEVICE_INFO (0x02) hiện có.
 class DeviceInfo {
   static const int defaultMaxText = 48;
 
   final int hardwareVersion;
   final int firmwareVersion;
-  final int capBitmap; // legacy u16 — bit cờ năng lực
-  final int maxText; // số byte text tối đa app nên gửi trên từng field
-
+  final int capBitmap;
+  final int maxText;
   final String manufacturerId;
   final String serialNumber;
   final int productId;
@@ -92,8 +121,7 @@ class DeviceInfo {
     this.modelId = 0,
   });
 
-  /// Capability bits (khớp firmware).
-  static const int capDiacritics = 1 << 0; // hỗ trợ hiển thị dấu tiếng Việt
+  static const int capDiacritics = 1 << 0;
   static const int capSpeedLimit = 1 << 1;
   static const int capTrafficSign = 1 << 2;
   static const int capLaneInfo = 1 << 3;
@@ -119,21 +147,135 @@ class DeviceInfo {
       '0x${(value & 0xFFFFFFFF).toRadixString(16).padLeft(8, '0').toUpperCase()}';
 }
 
-/// Snapshot trạng thái BLE cho UI (chip + S5 card).
+/// Thông tin sản phẩm tĩnh từ SYSTEM_INFO (0x03), cache theo BLE device ID.
+class DeviceSystemInfo {
+  static const int schemaVersion = 1;
+
+  final int vendorId;
+  final int modelId;
+  final int productId;
+  final int hardwareVersion;
+  final String manufacturerDate;
+  final String serialNumber;
+  final bool supportsBattery;
+  final bool supportsScreen;
+  final HudScreenType screenType;
+  final int screenWidth;
+  final int screenHeight;
+  final String mcuDescription;
+
+  const DeviceSystemInfo({
+    required this.vendorId,
+    required this.modelId,
+    required this.productId,
+    required this.hardwareVersion,
+    required this.manufacturerDate,
+    required this.serialNumber,
+    required this.supportsBattery,
+    required this.supportsScreen,
+    required this.screenType,
+    required this.screenWidth,
+    required this.screenHeight,
+    required this.mcuDescription,
+  });
+
+  factory DeviceSystemInfo.fromJson(Map<String, dynamic> json) {
+    if ((json['schema'] as num?)?.toInt() != schemaVersion) {
+      throw const FormatException('Unsupported SYSTEM_INFO cache schema');
+    }
+    return DeviceSystemInfo(
+      vendorId: (json['vendorId'] as num?)?.toInt() ?? 0,
+      modelId: (json['modelId'] as num?)?.toInt() ?? 0,
+      productId: (json['productId'] as num?)?.toInt() ?? 0,
+      hardwareVersion: (json['hardwareVersion'] as num?)?.toInt() ?? 0,
+      manufacturerDate: json['manufacturerDate'] as String? ?? '',
+      serialNumber: json['serialNumber'] as String? ?? '',
+      supportsBattery: json['supportsBattery'] as bool? ?? false,
+      supportsScreen: json['supportsScreen'] as bool? ?? false,
+      screenType: HudScreenType.fromWire(
+        (json['screenType'] as num?)?.toInt() ?? 0,
+      ),
+      screenWidth: (json['screenWidth'] as num?)?.toInt() ?? 0,
+      screenHeight: (json['screenHeight'] as num?)?.toInt() ?? 0,
+      mcuDescription: json['mcuDescription'] as String? ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'schema': schemaVersion,
+    'vendorId': vendorId,
+    'modelId': modelId,
+    'productId': productId,
+    'hardwareVersion': hardwareVersion,
+    'manufacturerDate': manufacturerDate,
+    'serialNumber': serialNumber,
+    'supportsBattery': supportsBattery,
+    'supportsScreen': supportsScreen,
+    'screenType': screenType.wire,
+    'screenWidth': screenWidth,
+    'screenHeight': screenHeight,
+    'mcuDescription': mcuDescription,
+  };
+
+  String get vendorIdString => _hex32(vendorId);
+  String get modelIdString => _hex32(modelId);
+  String get productIdString => _hex32(productId);
+  String get hardwareVersionString => _hex32(hardwareVersion);
+
+  static String _hex32(int value) =>
+      '0x${(value & 0xFFFFFFFF).toRadixString(16).padLeft(8, '0').toUpperCase()}';
+}
+
+/// Trạng thái động từ DEVICE_STATUS (0x04).
+class DeviceStatus {
+  static const int batteryPresentFlag = 1 << 0;
+  static const int chargingFlag = 1 << 1;
+  static const int screenOnFlag = 1 << 2;
+  static const int lowPowerFlag = 1 << 3;
+
+  final int flags;
+  final int? batteryPercent;
+  final int? supplyMillivolts;
+  final double? temperatureCelsius;
+  final int pinState;
+  final Duration uptime;
+  final int freeHeapBytes;
+  final DateTime receivedAt;
+
+  const DeviceStatus({
+    required this.flags,
+    required this.batteryPercent,
+    required this.supplyMillivolts,
+    required this.temperatureCelsius,
+    required this.pinState,
+    required this.uptime,
+    required this.freeHeapBytes,
+    required this.receivedAt,
+  });
+
+  bool get batteryPresent => flags & batteryPresentFlag != 0;
+  bool get charging => flags & chargingFlag != 0;
+  bool get screenOn => flags & screenOnFlag != 0;
+  bool get lowPower => flags & lowPowerFlag != 0;
+}
+
+/// Snapshot trạng thái BLE cho UI.
 class BleStatus {
   final BleConnectionState state;
   final DiscoveredDevice? device;
   final DeviceInfo? info;
+  final DeviceSystemInfo? systemInfo;
+  final DeviceStatus? deviceStatus;
   final int? rssi;
   final int? mtu;
-
-  /// Giây còn lại tới lần reconnect kế (khi disconnected) — chip đếm ngược.
   final int reconnectInSeconds;
 
   const BleStatus({
     this.state = BleConnectionState.unpaired,
     this.device,
     this.info,
+    this.systemInfo,
+    this.deviceStatus,
     this.rssi,
     this.mtu,
     this.reconnectInSeconds = 0,
@@ -143,6 +285,8 @@ class BleStatus {
     BleConnectionState? state,
     DiscoveredDevice? device,
     DeviceInfo? info,
+    DeviceSystemInfo? systemInfo,
+    DeviceStatus? deviceStatus,
     int? rssi,
     int? mtu,
     int? reconnectInSeconds,
@@ -151,6 +295,8 @@ class BleStatus {
       state: state ?? this.state,
       device: device ?? this.device,
       info: info ?? this.info,
+      systemInfo: systemInfo ?? this.systemInfo,
+      deviceStatus: deviceStatus ?? this.deviceStatus,
       rssi: rssi ?? this.rssi,
       mtu: mtu ?? this.mtu,
       reconnectInSeconds: reconnectInSeconds ?? this.reconnectInSeconds,
