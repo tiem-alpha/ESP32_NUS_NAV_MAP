@@ -35,6 +35,7 @@
 #include "sdkconfig.h"
 
 #include "clock_model.h"
+#include "img.h"
 #include "map_model.h"
 #include "nav_model.h"
 #include "nav_proto.h"
@@ -83,6 +84,9 @@ static lv_disp_t             *s_disp = NULL;
 static SemaphoreHandle_t s_lvgl_mutex = NULL;  /* đệ quy: bảo vệ mọi gọi LVGL */
 
 /* Widget overlay (xây 1 lần trong display_init). */
+static lv_obj_t *s_home_img     = NULL;  /* ảnh nền màn hình chính */
+static lv_obj_t *s_home_clock   = NULL;  /* đồng hồ nổi trên ảnh nền */
+static lv_obj_t *s_nav_layer    = NULL;  /* chứa toàn bộ giao diện dẫn đường */
 static lv_obj_t *s_map_obj      = NULL;  /* obj full-screen, custom draw map */
 static lv_obj_t *s_turn_label   = NULL;  /* mũi tên rẽ */
 static lv_obj_t *s_dist_label   = NULL;  /* "350 m" */
@@ -96,6 +100,8 @@ static lv_obj_t *s_clock_label  = NULL;  /* đồng hồ thực "07:42" */
 
 static bool s_connected     = false;  /* lưu state nếu UI chưa dựng */
 static bool s_ui_ready      = false;
+static bool s_navigation_active = false;
+static bool s_mode_ready        = false;
 
 /* ── Responsive layout helpers (tỉ lệ phần nghìn của màn hình) ─────────── */
 static inline lv_coord_t ratio_w(uint16_t permille)
@@ -351,8 +357,23 @@ static void build_ui(void)
     lv_obj_set_style_bg_color(scr, COL_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
+    /* Màn hình chính: ảnh 240x320 và đồng hồ nổi trong vùng trời phía trên. */
+    s_home_img = lv_img_create(scr);
+    lv_img_set_src(s_home_img, &img);
+    lv_obj_center(s_home_img);
+    lv_obj_clear_flag(s_home_img, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Toàn bộ UI dẫn đường nằm trong một layer để đổi màn hình nguyên khối. */
+    s_nav_layer = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_nav_layer);
+    lv_obj_set_size(s_nav_layer, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(s_nav_layer, 0, 0);
+    lv_obj_clear_flag(s_nav_layer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(s_nav_layer, COL_BG, 0);
+    lv_obj_set_style_bg_opa(s_nav_layer, LV_OPA_COVER, 0);
+
     /* Layer nền: obj full-screen trong suốt với custom draw vẽ map. */
-    s_map_obj = lv_obj_create(scr);
+    s_map_obj = lv_obj_create(s_nav_layer);
     lv_obj_remove_style_all(s_map_obj);
     lv_obj_set_size(s_map_obj, LCD_H_RES, LCD_V_RES);
     lv_obj_set_pos(s_map_obj, 0, 0);
@@ -361,7 +382,7 @@ static void build_ui(void)
     lv_obj_add_event_cb(s_map_obj, map_draw_event_cb, LV_EVENT_DRAW_MAIN, NULL);
 
     /* ── Overlay TRÊN-TRÁI: mũi tên rẽ + khoảng cách + tên đường. ── */
-    lv_obj_t *top_left = make_panel(scr);
+    lv_obj_t *top_left = make_panel(s_nav_layer);
     lv_coord_t top_w = LCD_H_RES - badge_size - margin * 3;
     if (top_w < ratio_w(500)) top_w = ratio_w(500);
     lv_obj_set_size(top_left, top_w, top_h);
@@ -389,7 +410,7 @@ static void build_ui(void)
     lv_obj_align(s_street_label, LV_ALIGN_BOTTOM_LEFT, left_text_x, 0);
 
     /* ── Overlay TRÊN-PHẢI: biển tốc độ (badge tròn). ── */
-    s_limit_panel = lv_obj_create(scr);
+    s_limit_panel = lv_obj_create(s_nav_layer);
     lv_obj_clear_flag(s_limit_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(s_limit_panel, badge_size, badge_size);
     lv_obj_align(s_limit_panel, LV_ALIGN_TOP_RIGHT, -margin, margin);
@@ -408,7 +429,7 @@ static void build_ui(void)
     lv_obj_add_flag(s_limit_panel, LV_OBJ_FLAG_HIDDEN);  /* ẩn tới khi có limit */
 
     /* ── Overlay DƯỚI-TRÁI: tốc độ hiện tại. ── */
-    lv_obj_t *bot_left = make_panel(scr);
+    lv_obj_t *bot_left = make_panel(s_nav_layer);
     lv_obj_set_size(bot_left, ratio_w(417), bottom_h);
     lv_obj_align(bot_left, LV_ALIGN_BOTTOM_LEFT, margin, -margin);
 
@@ -419,7 +440,7 @@ static void build_ui(void)
     lv_obj_center(s_speed_label);
 
     /* ── Overlay DƯỚI-PHẢI: ETA + còn lại. ── */
-    lv_obj_t *bot_right = make_panel(scr);
+    lv_obj_t *bot_right = make_panel(s_nav_layer);
     lv_obj_set_size(bot_right, ratio_w(500), bottom_h);
     lv_obj_align(bot_right, LV_ALIGN_BOTTOM_RIGHT, -margin, -margin);
 
@@ -430,7 +451,7 @@ static void build_ui(void)
     lv_obj_center(s_eta_label);
 
     /* ── Chấm trạng thái BLE (góc trên giữa). ── */
-    s_ble_dot = lv_obj_create(scr);
+    s_ble_dot = lv_obj_create(s_nav_layer);
     lv_obj_clear_flag(s_ble_dot, LV_OBJ_FLAG_SCROLLABLE);
     lv_coord_t dot_size = ratio_min(50);
     lv_obj_set_size(s_ble_dot, dot_size, dot_size);
@@ -451,7 +472,45 @@ static void build_ui(void)
     lv_label_set_text(s_clock_label, "--:--");
     lv_obj_align(s_clock_label, LV_ALIGN_TOP_RIGHT, 0, 0);
 
+    lv_obj_t *home_clock_panel = make_panel(scr);
+    lv_obj_set_size(home_clock_panel, ratio_w(500), ratio_h(125));
+    lv_obj_align(home_clock_panel, LV_ALIGN_TOP_MID, 0, ratio_h(53));
+    lv_obj_set_style_bg_opa(home_clock_panel, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(home_clock_panel, 0, 0);
+
+    s_home_clock = lv_label_create(home_clock_panel);
+    lv_obj_set_style_text_font(s_home_clock, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(s_home_clock, COL_TEXT, 0);
+    lv_label_set_text(s_home_clock, "--:--");
+    lv_obj_center(s_home_clock);
+
+    /* Trạng thái ban đầu của nav_model là IDLE. */
+    lv_obj_add_flag(s_nav_layer, LV_OBJ_FLAG_HIDDEN);
+    s_navigation_active = false;
+    s_mode_ready = true;
+
     s_ui_ready = true;
+}
+
+static void set_navigation_mode(bool active)
+{
+    if (s_mode_ready && s_navigation_active == active) {
+        return;
+    }
+
+    s_navigation_active = active;
+    s_mode_ready = true;
+
+    if (active) {
+        lv_obj_add_flag(s_home_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lv_obj_get_parent(s_home_clock), LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_nav_layer, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(s_home_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lv_obj_get_parent(s_home_clock), LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_nav_layer, LV_OBJ_FLAG_HIDDEN);
+        s_render_ready = false;
+    }
 }
 
 /* ── Cập nhật overlay từ nav_model ───────────────────────────────────── */
@@ -461,6 +520,24 @@ static void overlay_update(void)
     nav_model_get(&ov);
 
     char buf[48];
+
+    const bool active = ov.state == NAV_NAVIGATING || ov.state == NAV_REROUTING;
+    set_navigation_mode(active);
+
+    /* Đồng hồ dùng chung cho màn hình chính và overlay dẫn đường. */
+    uint8_t clk_h, clk_m;
+    if (clock_model_get_local(&clk_h, &clk_m)) {
+        snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)clk_h, (unsigned)clk_m);
+        lv_label_set_text(s_clock_label, buf);
+        lv_label_set_text(s_home_clock, buf);
+    } else {
+        lv_label_set_text(s_clock_label, "--:--");
+        lv_label_set_text(s_home_clock, "--:--");
+    }
+
+    if (!active) {
+        return;
+    }
 
     /* Mũi tên rẽ + khoảng cách. */
     if (ov.has_instruction) {
@@ -491,15 +568,6 @@ static void overlay_update(void)
         lv_label_set_text(s_eta_label, buf);
     } else {
         lv_label_set_text(s_eta_label, "--:-- · -- km");
-    }
-
-    /* Đồng hồ thực (khác ETA — đó là thời lượng còn lại). */
-    uint8_t clk_h, clk_m;
-    if (clock_model_get_local(&clk_h, &clk_m)) {
-        snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)clk_h, (unsigned)clk_m);
-        lv_label_set_text(s_clock_label, buf);
-    } else {
-        lv_label_set_text(s_clock_label, "--:--");
     }
 
     /* Biển tốc độ: hiện khi >0, đỏ nền khi vượt. */
@@ -538,7 +606,7 @@ static void lvgl_task(void *arg)
                 /* Chụp snapshot pose + geom TRƯỚC khi invalidate.
                  * map_draw_event_cb (gọi 1 lần/dải) dùng lại snapshot này
                  * → mọi strip thấy cùng dữ liệu, không đứt đoạn giữa frame. */
-                if (map_model_has_pose()) {
+                if (s_navigation_active && map_model_has_pose()) {
                     map_model_get_pose(&s_render_pose);
                     const map_geom_t *g = map_model_lock_geom();
                     if (g) {
@@ -552,7 +620,9 @@ static void lvgl_task(void *arg)
                     s_render_ready = false;
                 }
 
-                lv_obj_invalidate(s_map_obj);
+                if (s_navigation_active) {
+                    lv_obj_invalidate(s_map_obj);
+                }
             }
             lv_timer_handler();
             lvgl_unlock();
@@ -695,9 +765,15 @@ void display_set_connected(bool connected)
         return;  /* gọi quá sớm: chỉ lưu state, build_ui sẽ áp dụng */
     }
     if (lvgl_lock(100)) {
-        if (s_ui_ready && s_ble_dot) {
-            lv_obj_set_style_bg_color(s_ble_dot,
-                                      connected ? COL_DOT_ON : COL_DOT_OFF, 0);
+        if (s_ui_ready) {
+            if (s_ble_dot) {
+                lv_obj_set_style_bg_color(s_ble_dot,
+                                          connected ? COL_DOT_ON : COL_DOT_OFF, 0);
+            }
+            if (!connected) {
+                /* Mất BLE: rời giao diện dẫn đường và về màn hình chính ngay. */
+                set_navigation_mode(false);
+            }
         }
         lvgl_unlock();
     }

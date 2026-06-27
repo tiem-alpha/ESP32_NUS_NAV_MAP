@@ -45,6 +45,7 @@ static void app_nus_state_cb(nus_state_event_t event)
         break;
     case NUS_STATE_DISCONNECTED:
         ESP_LOGI(APP_TAG, "Disconnected");
+        nav_model_reset();
         display_set_connected(false);
         break;
     default:
