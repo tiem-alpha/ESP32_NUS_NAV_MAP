@@ -29,7 +29,7 @@ enum {
     MSG_SPEED_LIMIT     = 0x12, /* App→Dev: limit u8, is_over u8 */
     MSG_TRAFFIC_SIGN    = 0x13, /* App→Dev: sign_type u8, dist u16, value u8 */
     MSG_NAV_STATE       = 0x14, /* App→Dev: state u8 */
-    MSG_ACK             = 0x20, /* Dev→App: acked_type u8, seq u8 */
+    MSG_ACK             = 0x20, /* Dev→App: acked_type u8, seq u8, frame_crc u16 */
     MSG_BTN_EVENT       = 0x21, /* Dev→App: btn u8, action u8 */
     MSG_HEARTBEAT       = 0x7E, /* 2 chiều: uptime u32 */
     MSG_MAP_POSE        = 0x30, /* App→Dev: §6.2.1 */

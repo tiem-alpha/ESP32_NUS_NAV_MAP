@@ -1,6 +1,6 @@
 /*
  * nus_protocol.h — Tầng khung (frame) trên NUS: deframe SOF..CRC16, verify
- * CRC16/MCRF4XX, dispatch theo TYPE; encode + gửi frame; auto-ACK gói quan trọng.
+ * CRC16/MCRF4XX, dispatch theo TYPE; encode + gửi frame; auto-ACK mọi frame.
  * Transport-agnostic: nhận byte qua nus_protocol_feed(), gửi qua tx callback.
  */
 #pragma once
@@ -21,7 +21,7 @@ typedef esp_err_t (*nus_proto_tx_fn)(const uint8_t *data, uint16_t len, uint32_t
 /* Handler cho 1 TYPE. payload đã verify CRC, len = độ dài payload. */
 typedef void (*nus_proto_handler_t)(uint8_t type, const uint8_t *payload, uint16_t len, void *ctx);
 
-/* Khởi tạo. auto_ack=true → tự gửi ACK cho NAV_INSTRUCTION & NAV_STATE. */
+/* Khởi tạo. auto_ack=true → tự gửi ACK sau khi dispatch mọi frame hợp lệ. */
 esp_err_t nus_protocol_init(nus_proto_tx_fn tx, bool auto_ack);
 
 /* Đăng ký handler theo TYPE (decouple feature khỏi parser). */
@@ -33,8 +33,9 @@ void nus_protocol_feed(const uint8_t *data, uint16_t len);
 /* Đóng frame (SOF|TYPE|LEN|PAYLOAD|CRC) rồi gửi. len ≤ NAV_PROTO_MAX_PAYLOAD. */
 esp_err_t nus_protocol_send(uint8_t type, const uint8_t *payload, uint16_t len);
 
-/* Tiện ích gửi ACK. */
-void nus_protocol_send_ack(uint8_t acked_type, uint8_t seq);
+/* Tiện ích gửi ACK: echo CRC của frame gốc để phân biệt ACK trễ giữa các
+ * frame liên tiếp cùng TYPE. Payload ACK = type, seq, frame_crc u16 LE. */
+void nus_protocol_send_ack(uint8_t acked_type, uint8_t seq, uint16_t frame_crc);
 
 #ifdef __cplusplus
 }

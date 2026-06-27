@@ -12,9 +12,21 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "model.h"
 
 #define PROTO_TAG "NUS_PROTO"
+
+/* Nếu một ATT chunk bị mất ở HCI, parser không được giữ frame dở mãi rồi nối
+ * retry mới vào payload cũ. ACK timeout phía mobile là 1 s, nên 500 ms vừa đủ
+ * để reset frame dở trước lần retry mà không ảnh hưởng các chunk bình thường. */
+#define PROTO_PARTIAL_FRAME_TIMEOUT_US 500000LL
+
+/* Stop-and-wait có thể gửi lại frame khi notification ACK bị mất. Hai map
+ * handler tích luỹ fragment nên không được dispatch cùng một frame hai lần.
+ * Chỉ giữ frame map gần nhất; 30 s đủ phủ retry/reconnect ngắn và tránh nhầm
+ * với seq wrap ở một lần cập nhật rất lâu sau đó. */
+#define PROTO_DUPLICATE_WINDOW_US 30000000LL
 
 /* Số TYPE tối đa đăng ký handler (đủ cho 0x01..0x32 + dự phòng). */
 #define PROTO_HANDLER_MAX 24
@@ -57,6 +69,12 @@ typedef struct {
 
 static nus_proto_tx_fn s_tx       = NULL;
 static bool            s_auto_ack  = false;
+static int64_t         s_last_feed_us;
+static bool            s_last_map_valid;
+static uint8_t         s_last_map_type;
+static uint16_t        s_last_map_len;
+static int64_t         s_last_map_us;
+static uint8_t         s_last_map_payload[NAV_PROTO_MAX_PAYLOAD];
 static proto_entry_t   s_handlers[PROTO_HANDLER_MAX];
 static proto_parser_t  s_parser;
 
@@ -115,6 +133,8 @@ esp_err_t nus_protocol_init(nus_proto_tx_fn tx, bool auto_ack)
     memset(s_handlers, 0, sizeof(s_handlers));
     memset(&s_parser, 0, sizeof(s_parser));
     s_parser.state = ST_WAIT_SOF;
+    s_last_feed_us = 0;
+    s_last_map_valid = false;
 
     /* Handler nội bộ: tự trả DEVICE_INFO cho HELLO. */
     nus_protocol_register(MSG_HELLO, proto_on_hello, NULL);
@@ -146,26 +166,58 @@ void nus_protocol_register(uint8_t type, nus_proto_handler_t handler, void *ctx)
     e->ctx     = ctx;
 }
 
-/* ── Xử lý 1 frame đã verify CRC: auto-ACK rồi dispatch ──────────────── */
-static void proto_dispatch(uint8_t type, const uint8_t *payload, uint16_t len)
+/* ── Xử lý 1 frame đã verify CRC: dispatch rồi auto-ACK ──────────────── */
+static void proto_dispatch(uint8_t type, const uint8_t *payload, uint16_t len,
+                           uint16_t frame_crc)
 {
-    if (s_auto_ack) {
-        /* ACK mọi frame; seq = payload[0] chỉ có nghĩa với NAV_INSTRUCTION. */
-        uint8_t seq = (type == MSG_NAV_INSTRUCTION && len >= 1) ? payload[0] : 0;
-        nus_protocol_send_ack(type, seq);
+    int64_t now_us = esp_timer_get_time();
+    bool is_map_fragment = type == MSG_MAP_ROUTE || type == MSG_MAP_ROADS;
+    bool is_duplicate = is_map_fragment &&
+                        s_last_map_valid &&
+                        type == s_last_map_type &&
+                        len == s_last_map_len &&
+                        now_us - s_last_map_us <= PROTO_DUPLICATE_WINDOW_US &&
+                        memcmp(payload, s_last_map_payload, len) == 0;
+
+    if (!is_duplicate) {
+        proto_entry_t *e = proto_find(type);
+        if (e && e->handler) {
+            e->handler(type, payload, len, e->ctx);
+        }
+
+        if (is_map_fragment) {
+            s_last_map_valid = true;
+            s_last_map_type = type;
+            s_last_map_len = len;
+            s_last_map_us = now_us;
+            memcpy(s_last_map_payload, payload, len);
+        }
+    } else {
+        ESP_LOGW(PROTO_TAG, "duplicate map frame type 0x%02X, ACK without dispatch", type);
     }
 
-    proto_entry_t *e = proto_find(type);
-    if (e && e->handler) {
-        e->handler(type, payload, len, e->ctx);
+    if (s_auto_ack) {
+        /* ACK sau dispatch: app chỉ tiến queue khi frame đã tới handler. */
+        uint8_t seq = (type == MSG_NAV_INSTRUCTION && len >= 1) ? payload[0] : 0;
+        nus_protocol_send_ack(type, seq, frame_crc);
     }
 }
 
 void nus_protocol_feed(const uint8_t *data, uint16_t len)
 {
-    if (data == NULL) {
+    if (data == NULL || len == 0) {
         return;
     }
+
+    int64_t now_us = esp_timer_get_time();
+    if (s_parser.state != ST_WAIT_SOF &&
+        s_last_feed_us > 0 &&
+        now_us - s_last_feed_us > PROTO_PARTIAL_FRAME_TIMEOUT_US) {
+        ESP_LOGW(PROTO_TAG, "partial frame timeout, resync");
+        memset(&s_parser, 0, sizeof(s_parser));
+        s_parser.state = ST_WAIT_SOF;
+    }
+    s_last_feed_us = now_us;
 
     for (uint16_t i = 0; i < len; i++) {
         uint8_t byte = data[i];
@@ -234,7 +286,7 @@ void nus_protocol_feed(const uint8_t *data, uint16_t len)
             }
 
             if (crc == crc_rx) {
-                proto_dispatch(s_parser.type, s_parser.payload, s_parser.len);
+                proto_dispatch(s_parser.type, s_parser.payload, s_parser.len, crc_rx);
             } else {
                 ESP_LOGW(PROTO_TAG, "CRC mismatch type 0x%02X (rx 0x%04X calc 0x%04X)",
                          s_parser.type, crc_rx, crc);
@@ -281,8 +333,13 @@ esp_err_t nus_protocol_send(uint8_t type, const uint8_t *payload, uint16_t len)
     return s_tx(buf, total, PROTO_TX_WAIT_MS);
 }
 
-void nus_protocol_send_ack(uint8_t acked_type, uint8_t seq)
+void nus_protocol_send_ack(uint8_t acked_type, uint8_t seq, uint16_t frame_crc)
 {
-    uint8_t payload[2] = { acked_type, seq };
+    uint8_t payload[4] = {
+        acked_type,
+        seq,
+        (uint8_t)(frame_crc & 0xFF),
+        (uint8_t)(frame_crc >> 8),
+    };
     nus_protocol_send(MSG_ACK, payload, sizeof(payload));
 }

@@ -20,7 +20,7 @@
 //   0x12 SPEED_LIMIT    App→Dev  limit u8, is_over u8
 //   0x13 TRAFFIC_SIGN   App→Dev  sign_type u8, dist u16, value u8
 //   0x14 NAV_STATE      App→Dev  state u8 (0 idle/1 nav/2 reroute/3 arrived)
-//   0x20 ACK            Dev→App  acked_type u8, seq u8
+//   0x20 ACK            Dev→App  acked_type u8, seq u8, frame_crc u16
 //   0x21 BTN_EVENT      Dev→App  btn u8, action u8
 //   0x7E HEARTBEAT      2 chiều  uptime u32
 //
@@ -30,10 +30,12 @@
 //   gửi hình học ở hệ MÉT ĐỊA LÝ north-up quanh một điểm anchor tuyệt đối.
 //   Đổi heading KHÔNG cần gửi lại route/roads — chỉ MAP_POSE đổi.
 //
-//   Reliability: mọi frame ACK-gated (stop-and-wait, timeout 300 ms, retry 3×).
+//   Reliability: mọi frame ACK-gated (stop-and-wait, retry tới khi ACK hoặc
+//   kết nối bị ngắt).
 //   ESP32 ACK mọi frame nhận được (MSG_ACK 0x20). Coalesce = dedup only (đè
 //   frame cùng type chưa gửi). Frame > MTU−3 cắt qua _writeChunks — parser
-//   byte-stream ráp lại. WNR cho tất cả, app-level ACK đảm bảo độ tin cậy.
+//   byte-stream ráp lại. Write Request tuần tự hóa ATT; app-level ACK xác nhận
+//   ESP32 đã nhận đủ frame và kiểm CRC thành công.
 //
 //   0x30 MAP_POSE  App→Dev  lat i32(deg×1e7), lng i32(deg×1e7),
 //                           heading u16(0.1°, 0..3599), speed u8(km/h),
@@ -133,7 +135,7 @@ class BleMapSnapshot {
 const int _kSof = 0xA5;
 const int _kMaxPayload = 500;
 const int _kFrameOverhead = 6; // SOF + TYPE + LEN16 + CRC16
-const int _kPreferredMtu = 500;
+const int _kPreferredMtu = 247;
 const int _kPreferredWriteMax = _kPreferredMtu - 3; // ATT header = 3 bytes
 const int _kMaxSingleWritePayload = _kPreferredWriteMax - _kFrameOverhead;
 
@@ -172,7 +174,7 @@ const int _kMapMaxRoads =
 const int _kMapMaxRoadPts =
     30; // 40→30: ít pts hơn nhưng đổi lấy 33% road nhiều hơn
 
-// Payload tối đa mỗi MAP_ROADS frame để full frame vừa một ATT write khi MTU=500.
+// Payload tối đa mỗi MAP_ROADS frame để full frame vừa một ATT write MTU 247.
 const int _kMapRoadsMaxPayload = _kMaxSingleWritePayload;
 
 // Epsilon Douglas–Peucker (mét) — đơn giản hoá hình học route.
@@ -183,9 +185,11 @@ const int _systemInfoSchema = 1;
 const int _deviceStatusSchema = 1;
 const List<int> _kReconnectBackoffSec = [3, 6, 12, 24, 30];
 
-// Stop-and-wait ACK: timeout mỗi frame, số lần retry tối đa trước khi drop.
-const Duration _kAckTimeout = Duration(milliseconds: 300);
-const int _kAckMaxRetries = 3;
+// Stop-and-wait ACK. Không giới hạn số lần retry khi link vẫn còn connected:
+// write thành công chỉ xác nhận GATT, ACK mới xác nhận ESP32 đã parse đủ frame.
+const Duration _kAckTimeout = Duration(seconds: 1);
+const Duration _kRetryDelayMin = Duration(milliseconds: 100);
+const Duration _kRetryDelayMax = Duration(seconds: 2);
 
 /// Sự kiện nút bấm vật lý trên HUD (BTN_EVENT 0x21) → app xử lý (mute/repeat…).
 class ButtonEvent {
@@ -247,6 +251,7 @@ class BleBridge {
   // ── ACK-gated send state ─────────────────────────────────────────────
   Completer<void>? _ackCompleter;
   int _ackExpectedType = 0;
+  int _ackExpectedCrc = 0;
 
   // ── Snapshot để resend sau reconnect (§5.3) ──────────────────────────
   int _instructionSeq = 0;
@@ -1062,7 +1067,7 @@ class BleBridge {
   void _enqueue(
     int type,
     List<int> payload, {
-    bool withResponse = false,
+    bool withResponse = true,
     bool coalesce = false,
   }) {
     _enqueueFrame(
@@ -1076,7 +1081,7 @@ class BleBridge {
   void _enqueueFrame(
     Uint8List frame,
     int type, {
-    bool withResponse = false,
+    bool withResponse = true,
     bool coalesce = false,
   }) {
     if (_status.state != BleConnectionState.connected) return;
@@ -1097,24 +1102,41 @@ class BleBridge {
         final item = _queue.removeAt(0);
         final maxWriteLen = _maxWriteLen;
 
-        // Stop-and-wait: gửi frame, đợi MSG_ACK, retry khi timeout.
+        // Stop-and-wait: gửi frame, đợi MSG_ACK, retry cho tới khi ACK hoặc
+        // connectionState báo mất kết nối. Tuyệt đối không drop một frame chỉ
+        // vì hết một số retry cố định.
         var acked = false;
-        for (var attempt = 0; attempt <= _kAckMaxRetries; attempt++) {
+        var attempt = 0;
+        while (!acked && _status.state == BleConnectionState.connected) {
           if (_status.state != BleConnectionState.connected) break;
 
           final completer = Completer<void>();
           _ackCompleter = completer;
           _ackExpectedType = item.type;
+          _ackExpectedCrc = _frameCrc(item.frame);
 
           try {
             if (item.frame.length > maxWriteLen) {
               await _writeChunks(item.frame, maxWriteLen: maxWriteLen);
             } else {
-              await _transport.write(item.frame, withResponse: false);
+              // GATT Write Request tuần tự hóa cả frame nhỏ; app-level ACK bên
+              // dưới vẫn cần để biết ESP32 đã deframe + kiểm CRC thành công.
+              await _transport.write(
+                item.frame,
+                withResponse: item.withResponse,
+              );
             }
-          } catch (_) {
-            _ackCompleter = null;
-            break; // Lỗi write → thoát; connState xử lý reconnect.
+          } catch (e) {
+            if (identical(_ackCompleter, completer)) {
+              _ackCompleter = null;
+            }
+            debugPrint(
+              '[BleBridge] write failed type=0x${item.type.toRadixString(16)} '
+              'attempt=${attempt + 1}: $e; retry…',
+            );
+            attempt++;
+            await _waitBeforeRetry(attempt);
+            continue;
           }
 
           bool ok;
@@ -1130,19 +1152,27 @@ class BleBridge {
             acked = true;
             break;
           }
-          if (attempt < _kAckMaxRetries) {
-            debugPrint(
-              '[BleBridge] ACK timeout type=0x${item.type.toRadixString(16)}'
-              ' attempt=${attempt + 1}/$_kAckMaxRetries, retry…',
-            );
-          }
+          attempt++;
+          debugPrint(
+            '[BleBridge] ACK timeout type=0x${item.type.toRadixString(16)} '
+            'attempt=$attempt, retry…',
+          );
+          await _waitBeforeRetry(attempt);
         }
 
         if (!acked) {
           debugPrint(
-            '[BleBridge] no ACK after $_kAckMaxRetries retries'
-            ' type=0x${item.type.toRadixString(16)} → drop',
+            '[BleBridge] send interrupted by disconnect'
+            ' type=0x${item.type.toRadixString(16)}',
           );
+          // At-least-once qua reconnect: ACK có thể đã mất dù ESP32 đã nhận,
+          // vì vậy giữ lại frame hiện tại và gửi lại sau khi link phục hồi.
+          // Handler phía firmware phải chấp nhận bản sao (map dùng seq; các
+          // state message chỉ ghi đè state hiện tại).
+          if (!_intentionalDisconnect && !_disposed) {
+            _queue.insert(0, item);
+          }
+          break;
         }
       }
     } finally {
@@ -1153,7 +1183,19 @@ class BleBridge {
 
   // ── RX deframer (byte-stream state machine) — §6.1 ───────────────────
 
-  int get _maxWriteLen => math.max(20, _transport.mtu - 3);
+  // Dù peer từng báo MTU lớn hơn, không vượt 244 byte. 244 data + 3 ATT +
+  // 4 L2CAP = 251 byte, vừa một HCI ACL packet của ESP32 và tránh reassembly.
+  int get _maxWriteLen =>
+      math.max(20, math.min(_transport.mtu - 3, _kPreferredWriteMax));
+
+  Future<void> _waitBeforeRetry(int attempt) async {
+    final shift = math.min(attempt - 1, 4);
+    final delayMs = math.min(
+      _kRetryDelayMin.inMilliseconds * (1 << shift),
+      _kRetryDelayMax.inMilliseconds,
+    );
+    await Future<void>.delayed(Duration(milliseconds: delayMs));
+  }
 
   Future<void> _writeChunks(Uint8List data, {required int maxWriteLen}) async {
     for (var offset = 0; offset < data.length; offset += maxWriteLen) {
@@ -1197,8 +1239,16 @@ class BleBridge {
       case _typeAck:
         if (payload.length >= 2) {
           final ackedType = payload[0];
+          // Firmware mới echo CRC frame để ACK trễ của frame trước không thể
+          // xác nhận nhầm frame kế tiếp cùng TYPE. Vẫn nhận ACK 2-byte từ
+          // firmware cũ để tương thích khi nâng cấp từng phía.
+          final crcMatches =
+              payload.length < 4 || _readU16(payload, 2) == _ackExpectedCrc;
           final c = _ackCompleter;
-          if (c != null && !c.isCompleted && ackedType == _ackExpectedType) {
+          if (c != null &&
+              !c.isCompleted &&
+              ackedType == _ackExpectedType &&
+              crcMatches) {
             _ackCompleter = null;
             c.complete();
           }
@@ -1391,7 +1441,8 @@ class BleBridge {
     _stopHeartbeat();
     _stopClockSync();
     _stopStatusPoll();
-    _queue.clear();
+    // Giữ queue và frame đang chờ ACK để _drain gửi lại sau reconnect.
+    // disconnect() chủ động vẫn clear queue như trước.
     // Giải phóng bất kỳ ACK đang chờ để _drain không bị treo.
     final pendingAck = _ackCompleter;
     if (pendingAck != null && !pendingAck.isCompleted) {
@@ -1493,6 +1544,9 @@ class BleBridge {
 
   static int _readU16(Uint8List data, int offset) =>
       data[offset] | (data[offset + 1] << 8);
+
+  static int _frameCrc(Uint8List frame) =>
+      frame[frame.length - 2] | (frame[frame.length - 1] << 8);
 
   static int _readI16(Uint8List data, int offset) {
     final value = _readU16(data, offset);

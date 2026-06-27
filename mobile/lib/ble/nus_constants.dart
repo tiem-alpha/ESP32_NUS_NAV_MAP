@@ -17,6 +17,9 @@ class Nus {
   /// TX characteristic — phone NHẬN (Notify).
   static const String txCharUuid = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E';
 
-  /// MTU mong muốn khi negotiate trên Android (§5.2). iOS tự negotiate.
-  static const int desiredMtu = 500;
+  /// MTU 247 giữ mỗi ATT packet trong một HCI ACL packet 251 byte
+  /// (4 byte L2CAP + 3 byte ATT + 244 byte dữ liệu). MTU 500 buộc controller
+  /// ESP32 ráp nhiều ACL fragment và có thể gây lỗi `unfinished packet`.
+  /// iOS tự negotiate và bridge vẫn dùng MTU thực tế nhỏ hơn nếu cần.
+  static const int desiredMtu = 247;
 }

@@ -101,7 +101,8 @@ class FlutterBlueTransport implements IBleTransport {
     );
     debugPrint('[BleTransport] connect: GATT connected, requestMtu…');
 
-    // MTU 500 (Android). iOS bỏ qua (tự negotiate).
+    // MTU 247 (Android) để ATT packet vừa một HCI ACL packet. iOS bỏ qua
+    // request nếu không hỗ trợ và dùng MTU hệ thống tự negotiate.
     try {
       _mtu = await device.requestMtu(Nus.desiredMtu);
     } catch (e) {

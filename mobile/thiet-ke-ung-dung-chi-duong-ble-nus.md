@@ -308,7 +308,7 @@ NUS chỉ là "ống UART" — cần định nghĩa framing + message. Thiết k
 | 0x13 | TRAFFIC_SIGN | App→Dev | khi tới gần | sign_type u8 (enum), dist u16 (m), value u8 |
 | 0x14 | NAV_STATE | App→Dev | khi đổi | state u8 (idle/navigating/rerouting/arrived) |
 | 0x15 | LANE_INFO | App→Dev | optional | lane_count u8, lane_bitmap[] |
-| 0x20 | ACK | Dev→App | theo gói cần ACK | acked_type u8, seq u8 |
+| 0x20 | ACK | Dev→App | theo gói cần ACK | acked_type u8, seq u8, frame_crc u16 LE (echo CRC frame gốc để loại ACK trễ; app vẫn nhận payload 2 byte từ firmware cũ) |
 | 0x21 | BTN_EVENT | Dev→App | khi bấm nút trên HUD | btn u8, action u8 (vd: mute, repeat, zoom) |
 | 0x7E | HEARTBEAT | 2 chiều | 5 s | uptime u32 |
 
