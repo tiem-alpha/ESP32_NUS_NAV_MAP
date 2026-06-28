@@ -136,7 +136,7 @@ class BleMapSnapshot {
 const int _kSof = 0xA5;
 const int _kMaxPayload = 500;
 const int _kFrameOverhead = 6; // SOF + TYPE + LEN16 + CRC16
-const int _kPreferredMtu = 247;
+const int _kPreferredMtu = 185;
 const int _kPreferredWriteMax = _kPreferredMtu - 3; // ATT header = 3 bytes
 const int _kMaxSingleWritePayload = _kPreferredWriteMax - _kFrameOverhead;
 
@@ -194,6 +194,8 @@ const List<int> _kReconnectBackoffSec = [3, 6, 12, 24, 30];
 const Duration _kAckTimeout = Duration(seconds: 1);
 const Duration _kRetryDelayMin = Duration(milliseconds: 100);
 const Duration _kRetryDelayMax = Duration(seconds: 2);
+const Duration _kMapInterFrameGap = Duration(milliseconds: 12);
+const int _kAckAttemptsBeforeLinkReset = 6;
 
 /// Sự kiện nút bấm vật lý trên HUD (BTN_EVENT 0x21) → app xử lý (mute/repeat…).
 class ButtonEvent {
@@ -294,6 +296,19 @@ class BleBridge {
   BleStatus get currentStatus => _status;
   Stream<BleStatus> get status => _statusCtrl.stream;
   Stream<ButtonEvent> get buttonEvents => _btnCtrl.stream;
+
+  /// True khi route/roads còn đang gửi hoặc chờ ACK. Navigation dùng tín hiệu
+  /// này làm backpressure để không liên tục huỷ batch cũ ở tốc độ cao.
+  bool get isMapTransferBusy {
+    final waitingMapAck =
+        _ackCompleter != null &&
+        (_ackExpectedType == _typeMapRoute ||
+            _ackExpectedType == _typeMapRoads);
+    return waitingMapAck ||
+        _queue.any(
+          (item) => item.type == _typeMapRoute || item.type == _typeMapRoads,
+        );
+  }
 
   /// Snapshot dữ liệu map cuối cùng đã gửi cho ESP32 (null nếu chưa gửi lần nào).
   BleMapSnapshot? get currentMapSnapshot => _mapSnapshot;
@@ -1397,6 +1412,10 @@ class BleBridge {
               );
             }
             acked = true;
+            if ((item.type == _typeMapRoute || item.type == _typeMapRoads) &&
+                _queue.isNotEmpty) {
+              await Future<void>.delayed(_kMapInterFrameGap);
+            }
             break;
           }
           attempt++;
@@ -1404,6 +1423,19 @@ class BleBridge {
             '[BleBridge] ACK timeout type=0x${item.type.toRadixString(16)} '
             'attempt=$attempt, retry…',
           );
+          if (attempt >= _kAckAttemptsBeforeLinkReset) {
+            debugPrint(
+              '[BleBridge] BLE link stalled after $attempt ACK timeouts; '
+              'forcing reconnect and preserving queued frame',
+            );
+            try {
+              await _transport.disconnect();
+            } catch (_) {}
+            if (_status.state == BleConnectionState.connected) {
+              _onConnectionLost();
+            }
+            break;
+          }
           await _waitBeforeRetry(attempt);
         }
 

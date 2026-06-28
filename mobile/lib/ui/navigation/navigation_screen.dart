@@ -48,14 +48,12 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   bool _ending = false;
   bool _showEspPreview = false;
 
-  // MAP_POSITION: gửi vị trí mỗi 5m; resend map binary mỗi ~300m.
-  // Phải nhỏ hơn _kMapWindowM (1.2km, ble_bridge.dart) — nếu không anchor có
-  // thể trôi ra ngoài cửa sổ clip trước khi resend, làm hụt route/road gần đó.
+  // MAP_POSE nhỏ và được coalesce nên gửi mỗi GPS fix. Geometry dùng cửa sổ
+  // trượt + backpressure và dời anchor thưa hơn khi tốc độ cao.
   final _mapKey = GlobalKey<MapViewState>();
-  GeoPoint? _lastMapPosSent;
-  static const _mapPosMoveThresholdM = 5.0; // gửi MAP_POSE mỗi GPS tick (~1 Hz)
   GeoPoint? _lastMapDataCenter;
-  static const _mapDataResendThresholdM = 45.0;
+  static const _mapDataResendMinM = 45.0;
+  static const _mapDataResendMaxM = 180.0;
   static const _mapLibreRetryDelay = Duration(milliseconds: 350);
   static const _mapLibreMaxAttempts = 6;
   static const _overpassRefreshDistanceM = 300.0;
@@ -131,9 +129,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   Widget build(BuildContext context) {
     final snap = ref.watch(navControllerProvider);
 
-    // BLE reconnect → xoá cả hai pos-cache để GPS tick kế tiếp gửi lại ngay.
-    // _lastMapPosSent phải reset: nếu device đứng yên (<5m) sau reconnect,
-    // outer gate không thỏa → cả MAP_POSE lẫn map data đều không được gửi.
+    // BLE reconnect → ép geometry gửi lại ở GPS tick kế tiếp.
     ref.listen<AsyncValue<BleStatus>>(bleStatusProvider, (prev, next) {
       final prevState = prev?.value?.state;
       final nextState = next.value?.state;
@@ -141,7 +137,6 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
           nextState == BleConnectionState.connected) {
         _mapDataRequestId++;
         _lastMapDataCenter = null;
-        _lastMapPosSent = null;
       }
     });
 
@@ -158,35 +153,30 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
           if (mounted) _showArrivalSheet();
         });
       }
-      // Gửi MAP_POSITION mỗi 5m; resend map data mỗi ~70m.
+      // Pose/heading realtime mỗi GPS fix (~1 Hz); geometry thích nghi tốc độ.
       final pos = next.matchedPosition ?? next.currentPosition;
       if (pos != null) {
-        final lastPos = _lastMapPosSent;
-        if (lastPos == null ||
-            lastPos.distanceTo(pos) >= _mapPosMoveThresholdM) {
-          _lastMapPosSent = pos;
-          final viewSpanM =
-              _mapKey.currentState?.viewSpanMAt(pos.lat) ?? _defaultViewSpanM;
-          ref
-              .read(bleBridgeProvider)
-              .sendMapPosition(
-                lat: pos.lat,
-                lng: pos.lng,
-                bearing: next.bearing,
-                speedKmh: next.speedKmh.round(),
-                viewSpanM: viewSpanM,
-              );
-          if (next.isActive) {
-            final lastCenter = _lastMapDataCenter;
-            if (lastCenter == null ||
-                lastCenter.distanceTo(pos) >= _mapDataResendThresholdM) {
-              _lastMapDataCenter = pos;
-              _trySendMapData(snap: next, center: pos).then((sent) {
-                // Rollback nếu không gửi được (Overpass lỗi + fallback rỗng):
-                // giữ lastCenter cũ để GPS tick tiếp theo retry ngay.
-                if (!sent && mounted) _lastMapDataCenter = lastCenter;
-              });
-            }
+        final viewSpanM =
+            _mapKey.currentState?.viewSpanMAt(pos.lat) ?? _defaultViewSpanM;
+        ref
+            .read(bleBridgeProvider)
+            .sendMapPosition(
+              lat: pos.lat,
+              lng: pos.lng,
+              bearing: next.bearing,
+              speedKmh: next.speedKmh.round(),
+              viewSpanM: viewSpanM,
+            );
+        if (next.isActive) {
+          final lastCenter = _lastMapDataCenter;
+          final resendDistanceM = _mapDataResendDistanceM(next.speedKmh);
+          if (lastCenter == null ||
+              lastCenter.distanceTo(pos) >= resendDistanceM) {
+            _lastMapDataCenter = pos;
+            _trySendMapData(snap: next, center: pos).then((sent) {
+              // Busy/lỗi: rollback để GPS tick kế tiếp thử lại tại center mới nhất.
+              if (!sent && mounted) _lastMapDataCenter = lastCenter;
+            });
           }
         }
       }
@@ -545,6 +535,14 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   }) async {
     final route = snap.route;
     if (route == null || !snap.isActive) return false;
+    final bridge = ref.read(bleBridgeProvider);
+    if (bridge.isMapTransferBusy) {
+      MapDebug.log(
+        'BACKPRESSURE',
+        'skip geometry: previous route/roads still waiting for ACK',
+      );
+      return false;
+    }
     final requestId = ++_mapDataRequestId;
 
     MapDebug.log(
@@ -553,8 +551,6 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
           '${center.lng.toStringAsFixed(5)} route=${route.geometry.length}pts '
           'progress=${snap.routeProgressM.round()}m',
     );
-
-    final bridge = ref.read(bleBridgeProvider);
 
     // Route đã có sẵn trong NavSnapshot: gửi ngay, không giữ màn hình HUD trống
     // chỉ vì road nền từ MapLibre/Overpass chưa sẵn sàng.
@@ -597,6 +593,12 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
     // Khi thành công, kết quả sẽ được merge với tile/cache rồi gửi bản đầy đủ.
     unawaited(_enrichRoadsFromOverpass(center));
     return true;
+  }
+
+  double _mapDataResendDistanceM(double speedKmh) {
+    // Khoảng 5–6 giây giữa hai snapshot ở tốc độ cao. MAP_POSE vẫn trượt map
+    // mỗi giây nên không làm giảm độ mượt hoặc độ chính xác vị trí.
+    return (speedKmh * 1.6).clamp(_mapDataResendMinM, _mapDataResendMaxM);
   }
 
   /// Lần GPS đầu thường đến trước `onStyleLoaded` của MapLibre vài trăm ms.
@@ -674,6 +676,10 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
       if (!mounted) return;
 
       final bridge = ref.read(bleBridgeProvider);
+      if (bridge.isMapTransferBusy) {
+        MapDebug.log('BACKPRESSURE', 'defer Overpass roads while BLE map busy');
+        return;
+      }
       final merged = _mergeRoads(
         center: latestCenter,
         sources: [

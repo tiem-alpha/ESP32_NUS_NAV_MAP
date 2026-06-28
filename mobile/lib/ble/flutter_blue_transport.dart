@@ -101,8 +101,8 @@ class FlutterBlueTransport implements IBleTransport {
     );
     debugPrint('[BleTransport] connect: GATT connected, requestMtu…');
 
-    // MTU 247 (Android) để ATT packet vừa một HCI ACL packet. iOS bỏ qua
-    // request nếu không hỗ trợ và dùng MTU hệ thống tự negotiate.
+    // MTU 185 chừa headroom cho ACL controller ESP32-H2 khi map truyền liên tục.
+    // iOS bỏ qua request nếu không hỗ trợ và dùng MTU hệ thống tự negotiate.
     try {
       _mtu = await device.requestMtu(Nus.desiredMtu);
     } catch (e) {

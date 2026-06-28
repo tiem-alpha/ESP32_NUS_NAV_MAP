@@ -17,9 +17,9 @@ class Nus {
   /// TX characteristic — phone NHẬN (Notify).
   static const String txCharUuid = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E';
 
-  /// MTU 247 giữ mỗi ATT packet trong một HCI ACL packet 251 byte
-  /// (4 byte L2CAP + 3 byte ATT + 244 byte dữ liệu). MTU 500 buộc controller
-  /// ESP32 ráp nhiều ACL fragment và có thể gây lỗi `unfinished packet`.
+  /// MTU 185 là mức ổn định trên Android/ESP32-H2. MTU 247 tạo L2CAP packet
+  /// đúng 251 byte — sát biên ACL controller và đã quan sát lỗi
+  /// `BT_HCI: ACL packet too short` khi truyền map liên tục.
   /// iOS tự negotiate và bridge vẫn dùng MTU thực tế nhỏ hơn nếu cần.
-  static const int desiredMtu = 247;
+  static const int desiredMtu = 185;
 }

@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../navigation/nav_controller.dart';
 import '../../providers/ble_providers.dart';
 import 'hud_painter.dart';
 
@@ -17,12 +16,6 @@ class EspPreviewPanel extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final snap = ref.watch(bleMapSnapshotProvider);
-    // Dùng bearing live từ NavController (cập nhật mỗi GPS tick, kể cả đứng yên
-    // hoặc vừa rẽ) thay vì heading từ BLE snapshot (chỉ cập nhật mỗi 5m) — để
-    // preview xoay heading-up đồng bộ với bản đồ chính.
-    final liveBearing = ref.watch(
-      navControllerProvider.select((s) => s.bearing),
-    );
     final routeColor = Theme.of(context).colorScheme.primary;
     final displayConfig = ref.watch(hudDisplayConfigProvider);
     final panelWidth = MediaQuery.sizeOf(context).shortestSide * 0.32;
@@ -56,7 +49,7 @@ class EspPreviewPanel extends ConsumerWidget {
                     painter: HudPainter(
                       displayConfig: displayConfig,
                       user: s.user,
-                      headingDeg: liveBearing,
+                      headingDeg: s.headingDeg,
                       routeGeometry: s.route,
                       roads: s.roads,
                       speedKmh: s.speedKmh.toDouble(),
