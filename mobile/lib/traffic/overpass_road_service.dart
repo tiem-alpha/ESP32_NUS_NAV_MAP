@@ -10,7 +10,7 @@ import '../models/road_segment.dart';
 /// Best-effort: mọi lỗi (mạng, parse) đều trả `const []`.
 class OverpassRoadService {
   /// Parse tối đa bao nhiêu way từ Overpass. Không giới hạn sớm ở đây vì
-  /// _encodeMapRoads sẽ sort theo khoảng cách và chỉ gửi 48 đường gần nhất.
+  /// _encodeMapRoads sẽ cắt theo cửa sổ và point-budget trước khi gửi ESP32.
   /// Giới hạn cao để tránh OOM trong trường hợp cực đoan (khu trung tâm đặc).
   static const int _maxSegments = 2000;
 
@@ -41,7 +41,9 @@ class OverpassRoadService {
 
     for (final url in _endpoints) {
       try {
-        debugPrint('[Overpass] POST $url radius=${radiusM.round()}m center=$lat,$lng');
+        debugPrint(
+          '[Overpass] POST $url radius=${radiusM.round()}m center=$lat,$lng',
+        );
         final resp = await _dio.post<dynamic>(
           url,
           data: {'data': query},
@@ -56,7 +58,9 @@ class OverpassRoadService {
 
         final data = _asMap(resp.data);
         final elements = data['elements'] as List<dynamic>? ?? const [];
-        debugPrint('[Overpass] HTTP ${resp.statusCode} → ${elements.length} elements from $url');
+        debugPrint(
+          '[Overpass] HTTP ${resp.statusCode} → ${elements.length} elements from $url',
+        );
 
         var skippedType = 0, skippedHighway = 0, skippedGeom = 0;
         final segments = <RoadSegment>[];
@@ -64,13 +68,22 @@ class OverpassRoadService {
           if (segments.length >= _maxSegments) break;
           try {
             final m = _asMap(el);
-            if (m['type'] != 'way') { skippedType++; continue; }
+            if (m['type'] != 'way') {
+              skippedType++;
+              continue;
+            }
 
             final tags = _asMap(m['tags']);
             final highway = tags['highway']?.toString();
-            if (highway == null || highway.isEmpty) { skippedHighway++; continue; }
+            if (highway == null || highway.isEmpty) {
+              skippedHighway++;
+              continue;
+            }
             // Bỏ các lớp không phải đường xe chạy (footway, cycleway, path…).
-            if (!_isVehicleHighway(highway)) { skippedHighway++; continue; }
+            if (!_isVehicleHighway(highway)) {
+              skippedHighway++;
+              continue;
+            }
 
             final geom = m['geometry'] as List<dynamic>? ?? const [];
             final points = <GeoPoint>[];
@@ -82,15 +95,25 @@ class OverpassRoadService {
               points.add(GeoPoint(glat, glon));
             }
             // Bỏ way không đủ điểm để vẽ một đoạn thẳng.
-            if (points.length < 2) { skippedGeom++; continue; }
+            if (points.length < 2) {
+              skippedGeom++;
+              continue;
+            }
 
-            segments.add(RoadSegment(type: HighwayType.fromOsmTag(highway), points: points));
+            segments.add(
+              RoadSegment(
+                type: HighwayType.fromOsmTag(highway),
+                points: points,
+              ),
+            );
           } catch (e) {
             debugPrint('[Overpass] element parse error: $e');
           }
         }
-        debugPrint('[Overpass] parsed: ${segments.length} roads'
-            ' (skip: type=$skippedType highway=$skippedHighway geom=$skippedGeom)');
+        debugPrint(
+          '[Overpass] parsed: ${segments.length} roads'
+          ' (skip: type=$skippedType highway=$skippedHighway geom=$skippedGeom)',
+        );
         return segments;
       } catch (e) {
         debugPrint('[Overpass] $url FAILED: $e → try next endpoint');

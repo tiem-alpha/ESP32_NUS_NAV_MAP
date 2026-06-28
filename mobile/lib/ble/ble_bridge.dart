@@ -50,7 +50,7 @@
 //                           i16, north i16} (dm so với anchor, north-up).
 //                           Fragment nhiều frame cùng seq khi vượt payload 1 BLE write.
 //   0x32 MAP_ROADS App→Dev  header: anchor_lat i32, anchor_lng i32, seq u8,
-//                           road_count u8; rồi mỗi road: class u8
+//                           frag_idx u8, frag_total u8, road_count u8; rồi mỗi road: class u8
 //                           (HighwayType.value), pt_count u8, pt_count×{east
 //                           i16, north i16} (dm). Ưu tiên class nhỏ trước;
 //                           bỏ road kém quan trọng / ngoài cửa sổ.
@@ -167,19 +167,22 @@ const double _kRouteLeadInM = 50.0;
 
 // Khớp MAP_MAX_ROADS phía firmware (map_model.h) — road vượt ngưỡng này bị
 // firmware âm thầm bỏ theo thứ tự đến, nên phải tự cắt + ưu tiên ở mobile.
-const int _kMapMaxRoads =
-    64; // khớp MAP_MAX_ROADS firmware; RAM giống cũ (64×122B ≈ 48×162B)
+const int _kMapMaxRoads = 128;
+
+// Firmware H2 dùng point-pool phẳng: nhiều road ngắn dùng chung ngân sách thay vì
+// mỗi road chiếm cứng 30 điểm. 1536 điểm + metadata vẫn xấp xỉ RAM bản 64×30 cũ.
+const int _kMapMaxRoadPoints = 1536;
 
 // Số điểm tối đa mỗi road gửi xuống — khớp MAP_MAX_ROAD_PTS firmware. Gửi
 // nhiều hơn chỉ lãng phí băng thông vì firmware sẽ bỏ phần thừa.
-const int _kMapMaxRoadPts =
-    30; // 40→30: ít pts hơn nhưng đổi lấy 33% road nhiều hơn
+const int _kMapMaxRoadPts = 16;
 
 // Payload tối đa mỗi MAP_ROADS frame để full frame vừa một ATT write MTU 247.
 const int _kMapRoadsMaxPayload = _kMaxSingleWritePayload;
 
 // Epsilon Douglas–Peucker (mét) — đơn giản hoá hình học route.
 const double _kSimplifyEpsM = 2.5;
+const int _kMapMaxRoutePts = 200; // khớp ESP32-H2 MAP_MAX_ROUTE_PTS
 
 const int _protoVer = 1;
 const int _systemInfoSchema = 1;
@@ -260,6 +263,7 @@ class BleBridge {
   Uint8List? _lastDistanceTickFrame;
   Uint8List? _lastSpeedLimitFrame;
   Uint8List? _lastNavStateFrame;
+  Uint8List? _lastMapPoseFrame;
 
   // ── Dedup mũi tên rẽ — chỉ gửi NAV_INSTRUCTION khi thực sự đổi ──────
   int _lastSentManeuverWire = -1;
@@ -393,6 +397,8 @@ class BleBridge {
     _lastDistanceTickFrame = null;
     _lastSpeedLimitFrame = null;
     _lastNavStateFrame = null;
+    _lastMapPoseFrame = null;
+    _mapSnapshot = null;
     _lastPose = null;
     _routeSeq = 0;
     _roadsSeq = 0;
@@ -448,7 +454,9 @@ class BleBridge {
     b.addByte(speedKmh.clamp(0, 255)); // speed u8 (km/h)
     b.addByte(flags); // flags u8
     _putU16(b, (viewSpanM * 10).round().clamp(1, 65535)); // view_span_dm
-    _enqueue(_typeMapPose, b.toBytes(), coalesce: true);
+    final poseFrame = _frame(_typeMapPose, b.toBytes());
+    _lastMapPoseFrame = poseFrame;
+    _enqueueFrame(poseFrame, _typeMapPose, coalesce: true);
 
     // Emit snapshot cho HUD sim mobile.
     final prev = _mapSnapshot;
@@ -527,9 +535,38 @@ class BleBridge {
     final clipped = shouldSendRoute
         ? _clipToWindow(trimmed, anchor)
         : const <GeoPoint>[];
-    final simplified = shouldSendRoute
+    var simplified = shouldSendRoute
         ? _douglasPeucker(clipped, _kSimplifyEpsM)
         : prev.route;
+
+    // routeProgress có thể chậm hơn route geometry mới sau reroute. Khi đó phép trim
+    // hợp lệ về số học nhưng chọn một đoạn ở xa anchor và clip thành rỗng. Cửa sổ
+    // trượt theo vị trí thật là lớp cứu hộ: tìm đoạn gần xe rồi lấy lead-in + phần trước.
+    if (shouldSendRoute && routeGeometry.length >= 2 && simplified.length < 2) {
+      final spatialWindow = _routeWindowNearAnchor(routeGeometry, anchor);
+      simplified = _douglasPeucker(spatialWindow, _kSimplifyEpsM);
+      MapDebug.log(
+        'ROUTE_WINDOW',
+        'progress window empty; spatial=${spatialWindow.length} '
+            'dp=${simplified.length}',
+      );
+    }
+
+    // Không bao giờ thay một route đang hiển thị bằng route rỗng do GPS/progress tạm
+    // lệch. Route chỉ được clear khi navigation kết thúc qua NAV_STATE.
+    if (shouldSendRoute &&
+        simplified.length < 2 &&
+        (prev?.route.length ?? 0) >= 2) {
+      simplified = prev!.route;
+      MapDebug.log(
+        'ROUTE_WINDOW',
+        'kept previous route=${simplified.length}pts',
+      );
+    }
+    if (simplified.length > _kMapMaxRoutePts) {
+      simplified = _limitRoadPoints(simplified, _kMapMaxRoutePts);
+      MapDebug.log('ROUTE_WINDOW', 'budgeted route=${simplified.length}pts');
+    }
 
     debugPrint(
       '[BleBridge] sendMapData: anchor=${anchor.lat.toStringAsFixed(5)},${anchor.lng.toStringAsFixed(5)}'
@@ -549,22 +586,10 @@ class BleBridge {
       );
     }
 
-    if (prev != null) {
-      _mapSnapshot = prev.copyWith(
-        anchor: anchor,
-        route: simplified,
-        roads: effectiveRoads,
-      );
-      if (!_mapCtrl.isClosed) _mapCtrl.add(_mapSnapshot!);
-    } else {
-      debugPrint(
-        '[BleBridge] sendMapData: _mapSnapshot=null, snapshot NOT updated (no MAP_POSE sent yet?)',
-      );
-    }
-
     // withResponse: true — một fragment rớt là hỏng cả lần reassembly trên
     // ESP32 (route/roads không bao giờ hiện); Write-No-Response không đảm
     // bảo gửi tới khi burst nhiều frame liên tiếp như khi fragment route dài.
+    List<Uint8List> routeFrames = const [];
     if (shouldSendRoute) {
       // Ưu tiên batch map mới nhất; không để road frames của anchor cũ nằm trước
       // route mới trong queue và làm hình học tạm thời lệch/mất khỏi màn hình.
@@ -578,7 +603,7 @@ class BleBridge {
             'remaining=${_queue.length}',
       );
       _routeSeq = (_routeSeq + 1) & 0xFF;
-      final routeFrames = _encodeMapRoute(simplified, anchor, _routeSeq);
+      routeFrames = _encodeMapRoute(simplified, anchor, _routeSeq);
       debugPrint(
         '[BleBridge] MAP_ROUTE seq=$_routeSeq → ${routeFrames.length} frames (${simplified.length} pts)',
       );
@@ -590,6 +615,25 @@ class BleBridge {
           coalesce: false,
         );
       }
+    }
+
+    final roadBatch = includeRoads
+        ? _encodeMapRoads(effectiveRoads, anchor, (_roadsSeq + 1) & 0xFF)
+        : null;
+
+    // Preview dùng đúng subset sau cửa sổ + point budget mà firmware sẽ nhận.
+    // Nhờ vậy "preview có nhưng ESP thiếu" không còn bị che bởi 400 road nguồn.
+    if (prev != null) {
+      _mapSnapshot = prev.copyWith(
+        anchor: anchor,
+        route: simplified,
+        roads: roadBatch?.roads ?? prev.roads,
+      );
+      if (!_mapCtrl.isClosed) _mapCtrl.add(_mapSnapshot!);
+    } else {
+      debugPrint(
+        '[BleBridge] sendMapData: _mapSnapshot=null, snapshot NOT updated (no MAP_POSE sent yet?)',
+      );
     }
 
     // Cho phép gửi route ngay trong khi nguồn road nền (MapLibre/Overpass) còn
@@ -610,7 +654,7 @@ class BleBridge {
           'remaining=${_queue.length}',
     );
     _roadsSeq = (_roadsSeq + 1) & 0xFF;
-    final roadsFrames = _encodeMapRoads(effectiveRoads, anchor, _roadsSeq);
+    final roadsFrames = roadBatch!.frames;
     debugPrint(
       '[BleBridge] MAP_ROADS seq=$_roadsSeq → ${roadsFrames.length} frames',
     );
@@ -880,6 +924,48 @@ class BleBridge {
     return out;
   }
 
+  /// Cửa sổ trượt không phụ thuộc routeProgress: chọn đỉnh gần vị trí xe nhất,
+  /// giữ một đoạn ngắn phía sau và đủ xa phía trước để route luôn phủ viewport.
+  List<GeoPoint> _routeWindowNearAnchor(
+    List<GeoPoint> geometry,
+    GeoPoint anchor,
+  ) {
+    if (geometry.length < 2) return geometry;
+
+    var nearest = 0;
+    var nearestDistance = double.infinity;
+    for (var i = 0; i < geometry.length; i++) {
+      final distance = anchor.distanceTo(geometry[i]);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearest = i;
+      }
+    }
+
+    var start = nearest;
+    var walked = 0.0;
+    while (start > 0 && walked < _kRouteLeadInM) {
+      walked += geometry[start].distanceTo(geometry[start - 1]);
+      start--;
+    }
+
+    var end = nearest;
+    walked = 0.0;
+    while (end < geometry.length - 1 && walked < _kMapWindowM * 1.25) {
+      walked += geometry[end].distanceTo(geometry[end + 1]);
+      end++;
+    }
+
+    if (end == start) {
+      if (end < geometry.length - 1) {
+        end++;
+      } else if (start > 0) {
+        start--;
+      }
+    }
+    return geometry.sublist(start, end + 1);
+  }
+
   /// Douglas–Peucker đơn giản hoá polyline; [epsM] tính bằng MÉT (xấp xỉ qua
   /// chiếu phẳng quanh điểm đầu — đủ chính xác cho cửa sổ HUD vài km).
   List<GeoPoint> _douglasPeucker(List<GeoPoint> pts, double epsM) {
@@ -985,49 +1071,43 @@ class BleBridge {
   }
 
   /// MAP_ROADS (0x32) → fragment theo [seq] nếu cần. Mỗi frame: header
-  /// (anchor_lat i32, anchor_lng i32, seq u8, road_count u8 = 10 byte) + mỗi
+  /// (anchor_lat i32, anchor_lng i32, seq u8, frag_idx u8, frag_total u8,
+  /// road_count u8 = 12 byte) + mỗi
   /// road: class u8, pt_count u8, pt_count×{east i16, north i16}.
   /// Ưu tiên road GẦN tuyến đường chính (khả năng giao cắt cao) trước, road
   /// xa route bị cắt khi vượt [_kMapMaxRoads] — firmware chỉ giữ tối đa
   /// MAP_MAX_ROADS theo thứ tự đến nên road lân cận giao cắt (thường là
   /// đường nhỏ) không được xếp đầu sẽ bị rớt nếu chỉ sort theo class.
-  List<Uint8List> _encodeMapRoads(
+  ({List<Uint8List> frames, List<RoadSegment> roads}) _encodeMapRoads(
     List<RoadSegment> roads,
     GeoPoint anchor,
     int seq,
   ) {
-    // Lượng tử hoá từng road; bỏ road có MỌI điểm ngoài cửa sổ ~1.2 km.
-    final encoded = <({int cls, double dist, List<({int e, int n})> pts})>[];
+    // Lấy đoạn thực sự cắt cửa sổ trước khi giới hạn điểm. Cách cũ lấy 16/30 điểm
+    // ĐẦU của polyline dài nên thường bỏ nhầm đoạn đang nằm ngay cạnh xe.
+    final encoded =
+        <
+          ({HighwayType type, int cls, double dist, List<({int e, int n})> pts})
+        >[];
     for (final road in roads) {
-      var anyInside = false;
-      var minDist = double.infinity;
+      final window = _roadWindowPoints(road.points, anchor);
+      if (window.length < 2) continue;
+      final limited = _limitRoadPoints(window, _kMapMaxRoadPts);
       final pts = <({int e, int n})>[];
-      for (final p in road.points) {
-        final d = anchor.distanceTo(p);
-        if (d <= _kMapWindowM) anyInside = true;
-        if (d < minDist) minDist = d; // khoảng cách tới anchor (user)
+      var minDist = double.infinity;
+      for (final p in limited) {
+        minDist = math.min(minDist, anchor.distanceTo(p));
         final m = _toMeters(p, anchor);
         pts.add((e: _toDm(m.east), n: _toDm(m.north)));
-        if (pts.length >= _kMapMaxRoadPts) break; // khớp giới hạn firmware
       }
-      if (!anyInside || pts.length < 2) continue;
-      encoded.add((cls: road.type.value & 0xFF, dist: minDist, pts: pts));
+      encoded.add((
+        type: road.type,
+        cls: road.type.value & 0xFF,
+        dist: minDist,
+        pts: pts,
+      ));
     }
     final skippedOutside = roads.length - encoded.length;
-    if (encoded.isEmpty) {
-      // Vẫn gửi 1 frame road_count=0 để ESP32 chốt anchor mới và clear roads.
-      // Nếu không gửi, ESP32 giữ road_n cũ với anchor cũ → roads hiển thị sai
-      // vị trí sau khi MAP_ROUTE đến với anchor mới.
-      debugPrint(
-        '[MapRoads] _encodeMapRoads: all ${roads.length} roads outside window → send clear frame',
-      );
-      final b = BytesBuilder();
-      _putI32(b, (anchor.lat * 1e7).round());
-      _putI32(b, (anchor.lng * 1e7).round());
-      b.addByte(seq & 0xFF);
-      b.addByte(0); // road_count = 0
-      return [_frame(_typeMapRoads, b.toBytes())];
-    }
 
     // Ưu tiên road GẦN ANCHOR (user) trước — đảm bảo ngõ hẻm ngay bên cạnh
     // luôn được chọn thay vì bị đẩy ra ngoài budget bởi đường xa phía trước.
@@ -1037,32 +1117,40 @@ class BleBridge {
       if (byDist != 0) return byDist;
       return a.cls.compareTo(b.cls);
     });
-    final budgeted = encoded.length > _kMapMaxRoads
-        ? encoded.sublist(0, _kMapMaxRoads)
-        : encoded;
+    final budgeted =
+        <
+          ({HighwayType type, int cls, double dist, List<({int e, int n})> pts})
+        >[];
+    var pointBudget = 0;
+    for (final road in encoded) {
+      if (budgeted.length >= _kMapMaxRoads) break;
+      final remaining = _kMapMaxRoadPoints - pointBudget;
+      if (remaining < 2) break;
+      final pts = road.pts.length <= remaining
+          ? road.pts
+          : _sampleWirePoints(road.pts, remaining);
+      if (pts.length < 2) continue;
+      budgeted.add((type: road.type, cls: road.cls, dist: road.dist, pts: pts));
+      pointBudget += pts.length;
+    }
     debugPrint(
       '[MapRoads] _encodeMapRoads: in=${roads.length} outside=$skippedOutside valid=${encoded.length} budgeted=${budgeted.length}/$_kMapMaxRoads'
+      ' points=$pointBudget/$_kMapMaxRoadPoints'
       ' (window=${_kMapWindowM.round()}m, maxPts=$_kMapMaxRoadPts)',
     );
 
-    const headerLen = 4 + 4 + 1 + 1; // 10 byte
+    const headerLen = 4 + 4 + 1 + 1 + 1 + 1; // 12 byte
     final maxBody = _kMapRoadsMaxPayload - headerLen;
 
     // Gom road vào frame; mỗi road = 2 + pts*4 byte. Road không vừa 1 frame
     // (hiếm) thì cắt bớt điểm.
-    final frames = <Uint8List>[];
+    final chunks = <({Uint8List body, int count})>[];
     var body = BytesBuilder();
     var count = 0;
 
     void flush() {
       if (count == 0) return;
-      final b = BytesBuilder();
-      _putI32(b, (anchor.lat * 1e7).round());
-      _putI32(b, (anchor.lng * 1e7).round());
-      b.addByte(seq & 0xFF);
-      b.addByte(count & 0xFF);
-      b.add(body.toBytes());
-      frames.add(_frame(_typeMapRoads, b.toBytes()));
+      chunks.add((body: body.toBytes(), count: count));
       body = BytesBuilder();
       count = 0;
     }
@@ -1088,7 +1176,107 @@ class BleBridge {
       count++;
     }
     flush();
-    return frames;
+    if (chunks.isEmpty) {
+      chunks.add((body: Uint8List(0), count: 0));
+    }
+
+    final frames = <Uint8List>[];
+    for (var i = 0; i < chunks.length; i++) {
+      final b = BytesBuilder();
+      _putI32(b, (anchor.lat * 1e7).round());
+      _putI32(b, (anchor.lng * 1e7).round());
+      b.addByte(seq & 0xFF);
+      b.addByte(i & 0xFF);
+      b.addByte(chunks.length & 0xFF);
+      b.addByte(chunks[i].count & 0xFF);
+      b.add(chunks[i].body);
+      frames.add(_frame(_typeMapRoads, b.toBytes()));
+    }
+
+    final previewRoads = [
+      for (final road in budgeted)
+        RoadSegment(
+          type: road.type,
+          points: [for (final p in road.pts) _fromDm(p.e, p.n, anchor)],
+        ),
+    ];
+    return (frames: frames, roads: previewRoads);
+  }
+
+  List<GeoPoint> _roadWindowPoints(List<GeoPoint> points, GeoPoint anchor) {
+    if (points.length < 2) return const [];
+    var first = -1;
+    var last = -1;
+    for (var i = 0; i < points.length; i++) {
+      if (anchor.distanceTo(points[i]) <= _kMapWindowM) {
+        if (first < 0) first = i;
+        last = i;
+      }
+    }
+    if (first >= 0) {
+      return points.sublist(
+        math.max(0, first - 1),
+        math.min(points.length, last + 2),
+      );
+    }
+
+    // Hai đỉnh đều ngoài nhưng đoạn thẳng vẫn có thể cắt viewport.
+    var nearestSegment = -1;
+    var nearestDistance = double.infinity;
+    for (var i = 1; i < points.length; i++) {
+      final a = _toMeters(points[i - 1], anchor);
+      final b = _toMeters(points[i], anchor);
+      final dx = b.east - a.east;
+      final dy = b.north - a.north;
+      final len2 = dx * dx + dy * dy;
+      final t = len2 == 0
+          ? 0.0
+          : (-(a.east * dx + a.north * dy) / len2).clamp(0.0, 1.0);
+      final x = a.east + dx * t;
+      final y = a.north + dy * t;
+      final distance = math.sqrt(x * x + y * y);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestSegment = i;
+      }
+    }
+    if (nearestSegment < 0 || nearestDistance > _kMapWindowM) return const [];
+    return [points[nearestSegment - 1], points[nearestSegment]];
+  }
+
+  List<GeoPoint> _limitRoadPoints(List<GeoPoint> points, int maxPoints) {
+    if (points.length <= maxPoints) return points;
+    var epsilon = 1.0;
+    var simplified = points;
+    while (simplified.length > maxPoints && epsilon <= 64) {
+      simplified = _douglasPeucker(points, epsilon);
+      epsilon *= 1.6;
+    }
+    if (simplified.length <= maxPoints) return simplified;
+    return [
+      for (var i = 0; i < maxPoints; i++)
+        points[(i * (points.length - 1) / (maxPoints - 1)).round()],
+    ];
+  }
+
+  List<({int e, int n})> _sampleWirePoints(
+    List<({int e, int n})> points,
+    int maxPoints,
+  ) {
+    if (points.length <= maxPoints) return points;
+    return [
+      for (var i = 0; i < maxPoints; i++)
+        points[(i * (points.length - 1) / (maxPoints - 1)).round()],
+    ];
+  }
+
+  GeoPoint _fromDm(int eastDm, int northDm, GeoPoint anchor) {
+    const mPerDeg = 111320.0;
+    final cosLat = math.cos(anchor.lat * math.pi / 180);
+    return GeoPoint(
+      anchor.lat + (northDm / 10) / mPerDeg,
+      anchor.lng + (eastDm / 10) / (mPerDeg * cosLat),
+    );
   }
 
   // ── Frame codec (pure, unit-testable) ────────────────────────────────
@@ -1560,6 +1748,26 @@ class BleBridge {
     }
     if (_lastSpeedLimitFrame != null) {
       _enqueueFrame(_lastSpeedLimitFrame!, _typeSpeedLimit);
+    }
+    if (_lastMapPoseFrame != null) {
+      _enqueueFrame(
+        _lastMapPoseFrame!,
+        _typeMapPose,
+        withResponse: true,
+        coalesce: true,
+      );
+    }
+    final map = _mapSnapshot;
+    if (map != null && map.route.length >= 2) {
+      // Reconnect có thể xảy ra khi xe đứng yên nên không thể chờ GPS tick kế tiếp.
+      // Phát lại snapshot geometry ngay sau pose để HUD tự phục hồi đầy đủ.
+      unawaited(
+        sendMapData(
+          routeGeometry: map.route,
+          roads: map.roads,
+          routeProgressM: 0,
+        ),
+      );
     }
   }
 

@@ -285,8 +285,10 @@ static void map_draw_event_cb(lv_event_t *e)
     road_dsc.round_end = 1;
     for (int r = 0; r < s_render_geom.road_n; r++) {
         const map_road_t *road = &s_render_geom.roads[r];
+        if ((uint32_t)road->first_pt + road->n > s_render_geom.road_pt_n) continue;
         road_dsc.width = road_width_for_class(road->road_class);
-        draw_polyline(draw_ctx, &road_dsc, road->pts, road->n, &proj);
+        draw_polyline(draw_ctx, &road_dsc,
+                      &s_render_geom.road_pts[road->first_pt], road->n, &proj);
     }
 
     /* 2) Route (xanh, dày ~6). */

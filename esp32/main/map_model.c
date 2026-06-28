@@ -43,11 +43,11 @@ static uint8_t  s_route_seq;
 static uint8_t  s_route_frag_total;
 static uint8_t  s_route_next_frag;
 static bool     s_route_active;
-static bool     s_back_route_ready;
 
 static uint8_t  s_roads_seq;
+static uint8_t  s_roads_frag_total;
+static uint8_t  s_roads_next_frag;
 static bool     s_roads_active;
-static bool     s_back_roads_ready;
 
 static void map_lock(void)   { if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY); }
 static void map_unlock(void) { if (s_mutex) xSemaphoreGive(s_mutex); }
@@ -57,6 +57,20 @@ static void map_swap_to_front(void)
     map_lock();
     s_front       = s_back;   /* copy ~8 KB; mutex held brevemente */
     s_front.valid = true;
+    map_unlock();
+}
+
+/* Mỗi batch route/roads được dựng từ snapshot ĐÃ COMMIT gần nhất. Nếu một batch
+ * cũ bị thay giữa chừng, dữ liệu nửa vời trong back buffer không được phép lọt
+ * vào lần commit kế tiếp. Front vẫn được render nguyên vẹn trong lúc BLE nhận. */
+static void map_prepare_back_from_front(void)
+{
+    map_lock();
+    if (s_front.valid) {
+        s_back = s_front;
+    } else {
+        memset(&s_back, 0, sizeof(s_back));
+    }
     map_unlock();
 }
 
@@ -75,20 +89,24 @@ static void map_rebase_route_to(int32_t anchor_lat, int32_t anchor_lng)
     float lat_rad = (float)s_back.anchor_lat_e7 * 1e-7f
                     * (float)M_PI / 180.0f;
     float cos_lat = cosf(lat_rad);
-    int16_t dn = (int16_t)lroundf(
+    int32_t dn = (int32_t)lroundf(
         (float)dlat_e7 * 1e-7f * 111320.0f * 10.0f);
-    int16_t de = (int16_t)lroundf(
+    int32_t de = (int32_t)lroundf(
         (float)dlng_e7 * 1e-7f * 111320.0f * cos_lat * 10.0f);
 
     ESP_LOGI(MAP_TAG,
-             "rebase route: pts=%u de=%d dm dn=%d dm old=(%ld,%ld) new=(%ld,%ld)",
-             s_back.route_n, de, dn,
+             "rebase route: pts=%u de=%ld dm dn=%ld dm old=(%ld,%ld) new=(%ld,%ld)",
+             s_back.route_n, (long)de, (long)dn,
              s_back.anchor_lat_e7, s_back.anchor_lng_e7,
              anchor_lat, anchor_lng);
 
     for (uint16_t i = 0; i < s_back.route_n; i++) {
-        s_back.route[i].e_dm -= de;
-        s_back.route[i].n_dm -= dn;
+        int32_t e = (int32_t)s_back.route[i].e_dm - de;
+        int32_t n = (int32_t)s_back.route[i].n_dm - dn;
+        if (e < INT16_MIN) e = INT16_MIN; else if (e > INT16_MAX) e = INT16_MAX;
+        if (n < INT16_MIN) n = INT16_MIN; else if (n > INT16_MAX) n = INT16_MAX;
+        s_back.route[i].e_dm = (int16_t)e;
+        s_back.route[i].n_dm = (int16_t)n;
     }
 }
 
@@ -132,6 +150,8 @@ static void map_on_route(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
     if (frag_total == 0) return;
 
     if (frag_idx == 0) {
+        map_prepare_back_from_front();
+        s_roads_active = false; /* bỏ batch roads nửa chừng, front vẫn còn nguyên */
         /* Re-encode road points từ roads_anchor cũ sang route_anchor mới.
          * s_back.anchor_* hiện giữ roads_anchor (từ map_on_roads cuối).
          * Nếu không re-encode: roads lệch ~8–15m trong khoảng trống BLE giữa
@@ -144,15 +164,17 @@ static void map_on_route(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
                 float lat_rad = (float)s_back.anchor_lat_e7 * 1e-7f
                                 * (float)M_PI / 180.0f;
                 float cos_lat = cosf(lat_rad);
-                int16_t dn = (int16_t)lroundf(
+                int32_t dn = (int32_t)lroundf(
                     (float)dlat_e7 * 1e-7f * 111320.0f * 10.0f);
-                int16_t de = (int16_t)lroundf(
+                int32_t de = (int32_t)lroundf(
                     (float)dlng_e7 * 1e-7f * 111320.0f * cos_lat * 10.0f);
-                for (int r = 0; r < s_back.road_n; r++) {
-                    for (int i = 0; i < s_back.roads[r].n; i++) {
-                        s_back.roads[r].pts[i].e_dm -= de;
-                        s_back.roads[r].pts[i].n_dm -= dn;
-                    }
+                for (uint16_t i = 0; i < s_back.road_pt_n; i++) {
+                    int32_t e = (int32_t)s_back.road_pts[i].e_dm - de;
+                    int32_t n = (int32_t)s_back.road_pts[i].n_dm - dn;
+                    if (e < INT16_MIN) e = INT16_MIN; else if (e > INT16_MAX) e = INT16_MAX;
+                    if (n < INT16_MIN) n = INT16_MIN; else if (n > INT16_MAX) n = INT16_MAX;
+                    s_back.road_pts[i].e_dm = (int16_t)e;
+                    s_back.road_pts[i].n_dm = (int16_t)n;
                 }
             }
         }
@@ -182,7 +204,6 @@ static void map_on_route(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
     s_route_next_frag++;
 
     if (frag_idx == (uint8_t)(frag_total - 1)) {
-        s_back_route_ready = true;
         s_route_active     = false;
         map_swap_to_front();
         ESP_LOGI(MAP_TAG,
@@ -195,23 +216,42 @@ static void map_on_route(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
 static void map_on_roads(uint8_t type, const uint8_t *p, uint16_t len, void *ctx)
 {
     (void)type; (void)ctx;
-    if (len < 10) { ESP_LOGW(MAP_TAG, "MAP_ROADS too short (%u)", len); return; }
+    if (len < 12) { ESP_LOGW(MAP_TAG, "MAP_ROADS too short (%u)", len); return; }
 
     int32_t anchor_lat = le_i32(&p[0]);
     int32_t anchor_lng = le_i32(&p[4]);
     uint8_t seq        = p[8];
-    uint8_t road_count = p[9];
+    uint8_t frag_idx   = p[9];
+    uint8_t frag_total = p[10];
+    uint8_t road_count = p[11];
 
-    if (!s_roads_active || seq != s_roads_seq) {
+    if (frag_total == 0) return;
+
+    if (frag_idx == 0) {
+        map_prepare_back_from_front();
+        s_route_active = false; /* bỏ batch route nửa chừng, front vẫn còn nguyên */
         map_rebase_route_to(anchor_lat, anchor_lng);
         s_back.road_n        = 0;
+        s_back.road_pt_n     = 0;
         s_back.anchor_lat_e7 = anchor_lat;
         s_back.anchor_lng_e7 = anchor_lng;
         s_roads_seq          = seq;
+        s_roads_frag_total   = frag_total;
+        s_roads_next_frag    = 0;
         s_roads_active       = true;
+        ESP_LOGI(MAP_TAG, "roads seq=%u frags=%u anchor=(%ld,%ld)",
+                 seq, frag_total, anchor_lat, anchor_lng);
     }
 
-    uint16_t off = 10;
+    if (!s_roads_active || seq != s_roads_seq ||
+        frag_total != s_roads_frag_total || frag_idx != s_roads_next_frag) {
+        ESP_LOGW(MAP_TAG, "roads frag OOO seq=%u idx=%u/%u expected=%u",
+                 seq, frag_idx, frag_total, s_roads_next_frag);
+        s_roads_active = false;
+        return;
+    }
+
+    uint16_t off = 12;
     for (uint8_t r = 0; r < road_count; r++) {
         if ((uint16_t)(off + 2) > len) break;
         uint8_t cls      = p[off];
@@ -223,26 +263,39 @@ static void map_on_roads(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
             pt_count = (uint8_t)((len - off) / 4);
             need     = (uint16_t)pt_count * 4;
         }
-        if (s_back.road_n < MAP_MAX_ROADS) {
+        uint16_t room = MAP_MAX_ROAD_POINTS - s_back.road_pt_n;
+        uint8_t store_n = pt_count;
+        if (store_n > MAP_MAX_ROAD_PTS) store_n = MAP_MAX_ROAD_PTS;
+        if (store_n > room) store_n = (uint8_t)room;
+        if (s_back.road_n < MAP_MAX_ROADS && store_n >= 2) {
             map_road_t *rd = &s_back.roads[s_back.road_n];
             rd->road_class = cls;
-            rd->n          = 0;
-            for (uint8_t i = 0; i < pt_count && rd->n < MAP_MAX_ROAD_PTS; i++) {
-                rd->pts[rd->n].e_dm = le_i16(&p[off + i * 4 + 0]);
-                rd->pts[rd->n].n_dm = le_i16(&p[off + i * 4 + 2]);
-                rd->n++;
+            rd->first_pt   = s_back.road_pt_n;
+            rd->n          = store_n;
+            for (uint8_t i = 0; i < store_n; i++) {
+                s_back.road_pts[s_back.road_pt_n].e_dm = le_i16(&p[off + i * 4 + 0]);
+                s_back.road_pts[s_back.road_pt_n].n_dm = le_i16(&p[off + i * 4 + 2]);
+                s_back.road_pt_n++;
             }
             s_back.road_n++;
         }
         off += need;
     }
 
-    s_back_roads_ready = true;
-    map_swap_to_front();
+    s_roads_next_frag++;
     ESP_LOGI(MAP_TAG,
-             "roads frame: seq=%u added=%u total=%u route=%u anchor=(%ld,%ld)",
-             seq, road_count, s_back.road_n, s_back.route_n,
+             "roads frame: seq=%u frag=%u/%u added=%u total=%u pts=%u route=%u",
+             seq, frag_idx + 1, frag_total, road_count, s_back.road_n,
+             s_back.road_pt_n, s_back.route_n);
+
+    if (frag_idx == (uint8_t)(frag_total - 1)) {
+        s_roads_active = false;
+        map_swap_to_front();
+        ESP_LOGI(MAP_TAG,
+             "roads ready: seq=%u roads=%u pts=%u route=%u anchor=(%ld,%ld)",
+             seq, s_back.road_n, s_back.road_pt_n, s_back.route_n,
              s_back.anchor_lat_e7, s_back.anchor_lng_e7);
+    }
 }
 
 void map_model_init(void)
@@ -263,12 +316,13 @@ void map_model_init(void)
 #endif
 
     s_route_active = s_roads_active = false;
-    s_back_route_ready = s_back_roads_ready = false;
 
     nus_protocol_register(MSG_MAP_POSE,  map_on_pose,  NULL);
     nus_protocol_register(MSG_MAP_ROUTE, map_on_route, NULL);
     nus_protocol_register(MSG_MAP_ROADS, map_on_roads, NULL);
-    ESP_LOGI(MAP_TAG, "init");
+    ESP_LOGI(MAP_TAG, "init geom=%u B max_roads=%u road_points=%u route_points=%u",
+             (unsigned)sizeof(map_geom_t), (unsigned)MAP_MAX_ROADS,
+             (unsigned)MAP_MAX_ROAD_POINTS, (unsigned)MAP_MAX_ROUTE_PTS);
 }
 
 void map_model_get_pose(map_pose_t *out)

@@ -328,7 +328,7 @@ NUS chỉ là "ống UART" — cần định nghĩa framing + message. Thiết k
 |---|---|---|---|---|
 | 0x30 | MAP_POSE | App→Dev | thường xuyên (~2 Hz) | `lat` i32 (deg×1e7), `lng` i32 (deg×1e7), `heading` u16 (0.1°, 0..3599), `speed` u8 (km/h), `flags` u8 (bit0 gps_fix, bit1 off_route, bit2 navigating), `view_span_dm` u16 (mét×10 toàn chiều rộng màn hình điện thoại ở zoom hiện tại — ESP32 dùng để khớp tỷ lệ zoom) — **14 byte** |
 | 0x31 | MAP_ROUTE | App→Dev | hiếm | **header**: `anchor_lat` i32, `anchor_lng` i32, `seq` u8, `frag_idx` u8, `frag_total` u8, `n` u16; **rồi** `n`×{`east` i16, `north` i16} (decimet so với anchor, north-up). Fragment nhiều frame cùng `seq` khi LEN>200 |
-| 0x32 | MAP_ROADS | App→Dev | hiếm | **header**: `anchor_lat` i32, `anchor_lng` i32, `seq` u8, `road_count` u8; **rồi** mỗi road: `class` u8 (`HighwayType.value`), `pt_count` u8, `pt_count`×{`east` i16, `north` i16} (dm). Ưu tiên road **gần tuyến đường chính nhất** (khả năng giao cắt cao) trước, đồng hạng thì `class` nhỏ (đường lớn) trước; cắt về `MAP_MAX_ROADS` (firmware) khi vượt budget; fragment theo `seq` nếu cần |
+| 0x32 | MAP_ROADS | App→Dev | hiếm | **header**: `anchor_lat` i32, `anchor_lng` i32, `seq` u8, `frag_idx` u8, `frag_total` u8, `road_count` u8; **rồi** mỗi road: `class` u8 (`HighwayType.value`), `pt_count` u8, `pt_count`×{`east` i16, `north` i16} (dm). Ưu tiên road gần anchor; firmware chỉ swap khi nhận đủ `frag_total` để không vẽ batch dở dang. H2 dùng point-pool phẳng (128 road/1536 điểm) thay cho mảng điểm cố định mỗi road. |
 | 0x33 | MAP_CLOCK | App→Dev | mỗi 30 s + khi reconnect | `epoch_s` u32 (Unix time, UTC), `tz_offset_min` i16 (lệch giờ địa phương, phút) — ESP32 tick nội bộ giữa các lần sync bằng tick LVGL có sẵn |
 
 Ghi chú encode:

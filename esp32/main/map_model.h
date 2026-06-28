@@ -16,16 +16,18 @@ extern "C" {
 #endif
 
 /* Giới hạn buffer hình học — scale theo chip.
- * ESP32-H2 (không PSRAM): giữ nhỏ để fit trong ~84 KB heap còn lại.
- * ESP32-S3 + PSRAM: cấp từ PSRAM, có thể lớn hơn nhiều → mượt hơn, ít nháy. */
+ * Road dùng point-pool phẳng thay vì mỗi road giữ cứng MAP_MAX_ROAD_PTS điểm.
+ * Nhờ vậy H2 chứa được nhiều road ngắn hơn trong cùng ~8 KB/buffer. */
 #ifdef CONFIG_SPIRAM
   #define MAP_MAX_ROUTE_PTS 500
   #define MAP_MAX_ROADS     256
   #define MAP_MAX_ROAD_PTS   60
+  #define MAP_MAX_ROAD_POINTS 8192
 #else
   #define MAP_MAX_ROUTE_PTS 200
-  #define MAP_MAX_ROADS      64
+  #define MAP_MAX_ROADS     128
   #define MAP_MAX_ROAD_PTS   30
+  #define MAP_MAX_ROAD_POINTS 1536
 #endif
 
 typedef struct { int16_t e_dm, n_dm; } map_pt_t; /* north-up dm so với anchor */
@@ -33,7 +35,7 @@ typedef struct { int16_t e_dm, n_dm; } map_pt_t; /* north-up dm so với anchor 
 typedef struct {
     uint8_t  road_class; /* HighwayType.value */
     uint8_t  n;
-    map_pt_t pts[MAP_MAX_ROAD_PTS];
+    uint16_t first_pt;   /* offset trong map_geom_t.road_pts */
 } map_road_t;
 
 typedef struct {
@@ -42,8 +44,10 @@ typedef struct {
     int32_t  anchor_lng_e7;
     uint16_t route_n;
     map_pt_t route[MAP_MAX_ROUTE_PTS];
-    uint8_t  road_n;
+    uint16_t road_n;
     map_road_t roads[MAP_MAX_ROADS];
+    uint16_t road_pt_n;
+    map_pt_t road_pts[MAP_MAX_ROAD_POINTS];
 } map_geom_t;
 
 void map_model_init(void);                   /* đăng ký handler 0x30–0x32 */
