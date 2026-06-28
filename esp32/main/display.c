@@ -194,10 +194,10 @@ static void lvgl_tick_cb(void *arg)
 /* Kiểm tra 1 đoạn có giao vùng màn hình không (loại sớm đoạn ngoài hẳn). */
 static inline bool seg_maybe_visible(const scr_pt_t *a, const scr_pt_t *b)
 {
-    if (a->x < 0 && b->x < 0)               return false;
-    if (a->x >= LCD_H_RES && b->x >= LCD_H_RES) return false;
-    if (a->y < 0 && b->y < 0)               return false;
-    if (a->y >= LCD_V_RES && b->y >= LCD_V_RES) return false;
+    if ((int32_t)a->x < 0 && (int32_t)b->x < 0)               return false;
+    if ((int32_t)a->x >= (int32_t)LCD_H_RES && (int32_t)b->x >= (int32_t)LCD_H_RES) return false;
+    if ((int32_t)a->y < 0 && (int32_t)b->y < 0)               return false;
+    if ((int32_t)a->y >= (int32_t)LCD_V_RES && (int32_t)b->y >= (int32_t)LCD_V_RES) return false;
     return true;
 }
 
