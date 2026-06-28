@@ -49,20 +49,27 @@ class EspPreviewPanel extends ConsumerWidget {
           AspectRatio(
             aspectRatio: displayConfig.aspectRatio,
             child: snap.when(
-              data: (s) => CustomPaint(
-                painter: HudPainter(
-                  displayConfig: displayConfig,
-                  user: s.user,
-                  headingDeg: liveBearing,
-                  routeGeometry: s.route,
-                  roads: s.roads,
-                  speedKmh: s.speedKmh.toDouble(),
-                  routeColor: routeColor,
-                  roadColor: const Color(0xFF8A8A8E),
-                  // Dùng đúng zoom ESP32: px_per_m = SCR_W / viewSpanM.
-                  pxPerMOverride:
-                      displayConfig.screenW / s.viewSpanM.clamp(10, 5000),
-                ),
+              data: (s) => Stack(
+                fit: StackFit.expand,
+                children: [
+                  CustomPaint(
+                    painter: HudPainter(
+                      displayConfig: displayConfig,
+                      user: s.user,
+                      headingDeg: liveBearing,
+                      routeGeometry: s.route,
+                      roads: s.roads,
+                      speedKmh: s.speedKmh.toDouble(),
+                      routeColor: routeColor,
+                      roadColor: const Color(0xFF8A8A8E),
+                      // Dùng đúng zoom ESP32: px_per_m = SCR_W / viewSpanM.
+                      pxPerMOverride:
+                          displayConfig.screenW / s.viewSpanM.clamp(10, 5000),
+                    ),
+                  ),
+                  if (s.route.length < 2 && s.roads.isEmpty)
+                    const _MapWaitingOverlay(),
+                ],
               ),
               loading: () => const _Placeholder(label: 'Chờ BLE...'),
               error: (e, st) =>
@@ -75,6 +82,24 @@ class EspPreviewPanel extends ConsumerWidget {
             orElse: () => const SizedBox.shrink(),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _MapWaitingOverlay extends StatelessWidget {
+  const _MapWaitingOverlay();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(
+      child: Padding(
+        padding: EdgeInsets.all(8),
+        child: Text(
+          'Đang chờ dữ liệu bản đồ…',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white54, fontSize: 9),
+        ),
       ),
     );
   }

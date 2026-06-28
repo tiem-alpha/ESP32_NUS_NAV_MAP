@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "NavHUD Mobile (Map Debug)",
+      "type": "dart",
+      "request": "launch",
+      "cwd": "${workspaceFolder}/mobile",
+      "program": "lib/main.dart",
+      "toolArgs": [
+        "--dart-define=MAP_DEBUG_LOGS=true"
+      ]
+    }
+  ]
+}

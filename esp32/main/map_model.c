@@ -60,6 +60,38 @@ static void map_swap_to_front(void)
     map_unlock();
 }
 
+/* Đổi hệ tọa độ route từ anchor hiện tại sang anchor mới. MAP_ROUTE và
+ * MAP_ROADS là hai message độc lập; nếu pose dịch chuyển giữa hai lần encode,
+ * roads có thể mang anchor mới hơn. Không rebase route sẽ làm toàn bộ tuyến
+ * lệch vài mét, thậm chí ra khỏi viewport ở zoom gần. */
+static void map_rebase_route_to(int32_t anchor_lat, int32_t anchor_lng)
+{
+    if (s_back.route_n == 0 || s_back.anchor_lat_e7 == 0) return;
+
+    int32_t dlat_e7 = anchor_lat - s_back.anchor_lat_e7;
+    int32_t dlng_e7 = anchor_lng - s_back.anchor_lng_e7;
+    if (dlat_e7 == 0 && dlng_e7 == 0) return;
+
+    float lat_rad = (float)s_back.anchor_lat_e7 * 1e-7f
+                    * (float)M_PI / 180.0f;
+    float cos_lat = cosf(lat_rad);
+    int16_t dn = (int16_t)lroundf(
+        (float)dlat_e7 * 1e-7f * 111320.0f * 10.0f);
+    int16_t de = (int16_t)lroundf(
+        (float)dlng_e7 * 1e-7f * 111320.0f * cos_lat * 10.0f);
+
+    ESP_LOGI(MAP_TAG,
+             "rebase route: pts=%u de=%d dm dn=%d dm old=(%ld,%ld) new=(%ld,%ld)",
+             s_back.route_n, de, dn,
+             s_back.anchor_lat_e7, s_back.anchor_lng_e7,
+             anchor_lat, anchor_lng);
+
+    for (uint16_t i = 0; i < s_back.route_n; i++) {
+        s_back.route[i].e_dm -= de;
+        s_back.route[i].n_dm -= dn;
+    }
+}
+
 #define MAP_DEFAULT_VIEW_SPAN_DM 2000
 
 static void map_on_pose(uint8_t type, const uint8_t *p, uint16_t len, void *ctx)
@@ -153,7 +185,10 @@ static void map_on_route(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
         s_back_route_ready = true;
         s_route_active     = false;
         map_swap_to_front();
-        ESP_LOGI(MAP_TAG, "route ready: %u pts", s_back.route_n);
+        ESP_LOGI(MAP_TAG,
+                 "route ready: seq=%u pts=%u roads=%u anchor=(%ld,%ld)",
+                 seq, s_back.route_n, s_back.road_n,
+                 s_back.anchor_lat_e7, s_back.anchor_lng_e7);
     }
 }
 
@@ -168,6 +203,7 @@ static void map_on_roads(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
     uint8_t road_count = p[9];
 
     if (!s_roads_active || seq != s_roads_seq) {
+        map_rebase_route_to(anchor_lat, anchor_lng);
         s_back.road_n        = 0;
         s_back.anchor_lat_e7 = anchor_lat;
         s_back.anchor_lng_e7 = anchor_lng;
@@ -203,7 +239,10 @@ static void map_on_roads(uint8_t type, const uint8_t *p, uint16_t len, void *ctx
 
     s_back_roads_ready = true;
     map_swap_to_front();
-    ESP_LOGI(MAP_TAG, "roads frame: road_n=%u (seq=%u frame had %u roads)", s_back.road_n, seq, road_count);
+    ESP_LOGI(MAP_TAG,
+             "roads frame: seq=%u added=%u total=%u route=%u anchor=(%ld,%ld)",
+             seq, road_count, s_back.road_n, s_back.route_n,
+             s_back.anchor_lat_e7, s_back.anchor_lng_e7);
 }
 
 void map_model_init(void)

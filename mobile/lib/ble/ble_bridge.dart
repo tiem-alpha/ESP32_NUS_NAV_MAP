@@ -63,6 +63,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 
 import '../core/event_bus.dart';
+import '../core/map_debug.dart';
 import '../models/ble_device.dart';
 import '../models/geo_point.dart';
 import '../models/nav_event.dart';
@@ -496,10 +497,19 @@ class BleBridge {
     required List<GeoPoint> routeGeometry,
     required List<RoadSegment> roads,
     required double routeProgressM,
+    bool includeRoute = true,
+    bool includeRoads = true,
   }) async {
     if (!_supportsGraphicalMap) return;
-    final anchor =
-        _lastPose ?? (routeGeometry.isNotEmpty ? routeGeometry.first : null);
+    final prev = _mapSnapshot;
+    final shouldSendRoute = includeRoute || prev == null;
+    final previousAnchor = prev?.anchor;
+    // Roads-only phải dùng đúng anchor của route gần nhất. Nếu lấy _lastPose mới
+    // hơn vài mét, firmware đổi anchor nhưng route vẫn ở hệ cũ và biến khỏi màn.
+    final anchor = !shouldSendRoute && previousAnchor != null
+        ? previousAnchor
+        : (_lastPose ??
+              (routeGeometry.isNotEmpty ? routeGeometry.first : null));
     if (anchor == null) {
       debugPrint(
         '[BleBridge] sendMapData: anchor=null (lastPose=$_lastPose, routeLen=${routeGeometry.length}) → abort',
@@ -511,13 +521,19 @@ class BleBridge {
     // Thứ tự clip-trước-DP quan trọng: DP trên geometry dài có thể xoá hết
     // điểm gần user (đường thẳng dài), rồi clip trả rỗng → route đơ.
     // Clip trước đảm bảo luôn giữ điểm gần user; DP chỉ giản lược vùng hiển thị.
-    final trimmed = _trimTravelled(routeGeometry, routeProgressM);
-    final clipped = _clipToWindow(trimmed, anchor);
-    final simplified = _douglasPeucker(clipped, _kSimplifyEpsM);
+    final trimmed = shouldSendRoute
+        ? _trimTravelled(routeGeometry, routeProgressM)
+        : const <GeoPoint>[];
+    final clipped = shouldSendRoute
+        ? _clipToWindow(trimmed, anchor)
+        : const <GeoPoint>[];
+    final simplified = shouldSendRoute
+        ? _douglasPeucker(clipped, _kSimplifyEpsM)
+        : prev.route;
 
     debugPrint(
       '[BleBridge] sendMapData: anchor=${anchor.lat.toStringAsFixed(5)},${anchor.lng.toStringAsFixed(5)}'
-      ' route: raw=${routeGeometry.length}→trimmed=${trimmed.length}→clip=${clipped.length}→dp=${simplified.length}'
+      ' route: ${shouldSendRoute ? "raw=${routeGeometry.length}→trimmed=${trimmed.length}→clip=${clipped.length}→dp=${simplified.length}" : "keep=${simplified.length}"}'
       ' roads_in=${roads.length}',
     );
 
@@ -525,7 +541,6 @@ class BleBridge {
     // với anchor mới vẫn đúng vì GeoPoint là tọa độ tuyệt đối.
     // Route KHÔNG fallback: clipped rỗng nghĩa là route ngoài cửa sổ 1200m —
     // đây là trạng thái hợp lệ, không phải lỗi; gửi rỗng để ESP32 không vẽ.
-    final prev = _mapSnapshot;
     final effectiveRoads = roads.isNotEmpty ? roads : (prev?.roads ?? const []);
 
     if (roads.isEmpty && (prev?.roads.isNotEmpty ?? false)) {
@@ -550,15 +565,50 @@ class BleBridge {
     // withResponse: true — một fragment rớt là hỏng cả lần reassembly trên
     // ESP32 (route/roads không bao giờ hiện); Write-No-Response không đảm
     // bảo gửi tới khi burst nhiều frame liên tiếp như khi fragment route dài.
-    _routeSeq = (_routeSeq + 1) & 0xFF;
-    final routeFrames = _encodeMapRoute(simplified, anchor, _routeSeq);
-    debugPrint(
-      '[BleBridge] MAP_ROUTE seq=$_routeSeq → ${routeFrames.length} frames (${simplified.length} pts)',
-    );
-    for (final frame in routeFrames) {
-      _enqueueFrame(frame, _typeMapRoute, withResponse: true, coalesce: false);
+    if (shouldSendRoute) {
+      // Ưu tiên batch map mới nhất; không để road frames của anchor cũ nằm trước
+      // route mới trong queue và làm hình học tạm thời lệch/mất khỏi màn hình.
+      final queuedBefore = _queue.length;
+      _queue.removeWhere(
+        (item) => item.type == _typeMapRoute || item.type == _typeMapRoads,
+      );
+      MapDebug.log(
+        'QUEUE',
+        'route-priority dropped=${queuedBefore - _queue.length} '
+            'remaining=${_queue.length}',
+      );
+      _routeSeq = (_routeSeq + 1) & 0xFF;
+      final routeFrames = _encodeMapRoute(simplified, anchor, _routeSeq);
+      debugPrint(
+        '[BleBridge] MAP_ROUTE seq=$_routeSeq → ${routeFrames.length} frames (${simplified.length} pts)',
+      );
+      for (final frame in routeFrames) {
+        _enqueueFrame(
+          frame,
+          _typeMapRoute,
+          withResponse: true,
+          coalesce: false,
+        );
+      }
     }
 
+    // Cho phép gửi route ngay trong khi nguồn road nền (MapLibre/Overpass) còn
+    // đang tải. Firmware swap MAP_ROUTE độc lập nên HUD có thể vẽ tuyến và mũi
+    // tên tức thì; roads cũ vẫn được giữ cho tới lần cập nhật đầy đủ kế tiếp.
+    if (!includeRoads) {
+      debugPrint('[BleBridge] MAP_ROADS deferred');
+      return;
+    }
+
+    // Roads-only thay thế batch roads cũ chưa gửi, nhưng không xoá MAP_ROUTE mới
+    // đang chờ phía trước queue.
+    final queuedBefore = _queue.length;
+    _queue.removeWhere((item) => item.type == _typeMapRoads);
+    MapDebug.log(
+      'QUEUE',
+      'roads-replace dropped=${queuedBefore - _queue.length} '
+          'remaining=${_queue.length}',
+    );
     _roadsSeq = (_roadsSeq + 1) & 0xFF;
     final roadsFrames = _encodeMapRoads(effectiveRoads, anchor, _roadsSeq);
     debugPrint(
@@ -1149,6 +1199,15 @@ class BleBridge {
           if (identical(_ackCompleter, completer)) _ackCompleter = null;
 
           if (ok) {
+            if (item.type == _typeMapRoute || item.type == _typeMapRoads) {
+              final seq = item.frame.length > 12 ? item.frame[12] : -1;
+              MapDebug.log(
+                'ACK',
+                'type=0x${item.type.toRadixString(16)} seq=$seq '
+                    'attempt=${attempt + 1} crc=0x${_ackExpectedCrc.toRadixString(16)} '
+                    'queue=${_queue.length}',
+              );
+            }
             acked = true;
             break;
           }

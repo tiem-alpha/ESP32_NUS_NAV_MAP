@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/l10n/app_localizations.dart';
+import '../../core/map_debug.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/theme/app_typography.dart';
 import '../../models/ble_device.dart';
@@ -52,10 +55,20 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   GeoPoint? _lastMapPosSent;
   static const _mapPosMoveThresholdM = 5.0; // gửi MAP_POSE mỗi GPS tick (~1 Hz)
   GeoPoint? _lastMapDataCenter;
-  static const _mapDataResendThresholdM = 80.0;
+  static const _mapDataResendThresholdM = 45.0;
+  static const _mapLibreRetryDelay = Duration(milliseconds: 350);
+  static const _mapLibreMaxAttempts = 6;
+  static const _overpassRefreshDistanceM = 300.0;
+  static const _overpassRetryCooldown = Duration(minutes: 2);
+  static const _roadCacheRadiusM = 900.0;
+  static const _maxMergedRoads = 400;
+  int _mapDataRequestId = 0;
+  bool _overpassRoadsLoading = false;
+  GeoPoint? _lastOverpassRoadsCenter;
+  DateTime? _lastOverpassAttemptAt;
 
   // Fallback view_span_dm trước khi MapView layout xong (xem viewSpanMAt).
-  static const _defaultViewSpanM = 200.0;
+  static const _defaultViewSpanM = 300.0;
 
   @override
   void initState() {
@@ -126,6 +139,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
       final nextState = next.value?.state;
       if (prevState != BleConnectionState.connected &&
           nextState == BleConnectionState.connected) {
+        _mapDataRequestId++;
         _lastMapDataCenter = null;
         _lastMapPosSent = null;
       }
@@ -148,18 +162,21 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
       final pos = next.matchedPosition ?? next.currentPosition;
       if (pos != null) {
         final lastPos = _lastMapPosSent;
-        if (lastPos == null || lastPos.distanceTo(pos) >= _mapPosMoveThresholdM) {
+        if (lastPos == null ||
+            lastPos.distanceTo(pos) >= _mapPosMoveThresholdM) {
           _lastMapPosSent = pos;
-        final viewSpanM =
-            _mapKey.currentState?.viewSpanMAt(pos.lat) ?? _defaultViewSpanM;
-          ref.read(bleBridgeProvider).sendMapPosition(
-              lat: pos.lat,
-              lng: pos.lng,
-              bearing: next.bearing,
-              speedKmh: next.speedKmh.round(),
-              viewSpanM: viewSpanM,
-            );
-        if (next.isActive) {
+          final viewSpanM =
+              _mapKey.currentState?.viewSpanMAt(pos.lat) ?? _defaultViewSpanM;
+          ref
+              .read(bleBridgeProvider)
+              .sendMapPosition(
+                lat: pos.lat,
+                lng: pos.lng,
+                bearing: next.bearing,
+                speedKmh: next.speedKmh.round(),
+                viewSpanM: viewSpanM,
+              );
+          if (next.isActive) {
             final lastCenter = _lastMapDataCenter;
             if (lastCenter == null ||
                 lastCenter.distanceTo(pos) >= _mapDataResendThresholdM) {
@@ -299,7 +316,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
                 overflow: TextOverflow.ellipsis,
               ),
             // "Sau đó" next-maneuver strip khi < 500 m.
-            if (snap.nextManeuver != null && snap.distanceToManeuverM < 500)
+            if (snap.nextManeuver != null && snap.distanceToManeuverM < 700)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: Row(
@@ -528,40 +545,196 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen>
   }) async {
     final route = snap.route;
     if (route == null || !snap.isActive) return false;
+    final requestId = ++_mapDataRequestId;
 
-    debugPrint('[MapData] _trySendMapData: center=${center.lat.toStringAsFixed(5)},${center.lng.toStringAsFixed(5)} route=${route.geometry.length}pts progress=${snap.routeProgressM.round()}m');
+    MapDebug.log(
+      'REQUEST',
+      'id=$requestId center=${center.lat.toStringAsFixed(5)},'
+          '${center.lng.toStringAsFixed(5)} route=${route.geometry.length}pts '
+          'progress=${snap.routeProgressM.round()}m',
+    );
 
-    // Ưu tiên Overpass (bán kính 0.5 km, đầy đủ hơn). Nếu Overpass trả rỗng
-    // (lỗi mạng / timeout), dùng vector tiles của MapLibre làm fallback (~450 m
-    // viewport, không cần network thêm vì tiles đã được tải sẵn).
-    List<RoadSegment> roads;
-      try {
-        roads = await ref
-            .read(overpassRoadServiceProvider)
-          .queryRoadsAround(lat: center.lat, lng: center.lng, radiusM: 600.0);
-        debugPrint('[MapData] Overpass → ${roads.length} roads');
-      } catch (e) {
-        debugPrint('[MapData] Overpass ERROR: $e');
-        roads = const [];
-      }
+    final bridge = ref.read(bleBridgeProvider);
 
-      if (roads.isEmpty) {
-        final mapState = _mapKey.currentState;
-        final fallback = mapState != null
-            ? await mapState.queryRoadsForMiniMap(center.lat, center.lng)
-            : const <RoadSegment>[];
-        debugPrint('[MapData] MapLibre fallback → ${fallback.length} roads');
-        roads = fallback;
+    // Route đã có sẵn trong NavSnapshot: gửi ngay, không giữ màn hình HUD trống
+    // chỉ vì road nền từ MapLibre/Overpass chưa sẵn sàng.
+    await bridge.sendMapData(
+      routeGeometry: route.geometry,
+      roads: const [],
+      routeProgressM: snap.routeProgressM,
+      includeRoads: false,
+    );
+
+    // Ưu tiên vector tiles MapLibre đã tải sẵn: nhanh, offline và thường đã dư
+    // số road mà giới hạn BLE có thể gửi. Chỉ dùng Overpass khi tile chưa ready.
+    final mapLibreRoads = await _queryMapLibreRoads(
+      center: center,
+      requestId: requestId,
+    );
+    MapDebug.log(
+      'REQUEST',
+      'id=$requestId MapLibre=${mapLibreRoads.length} roads',
+    );
+
+    if (!mounted || requestId != _mapDataRequestId) return true;
+
+    // Không vứt road tốt của lần trước khi tile mới chưa tải đủ. Hợp nhất cache
+    // với MapLibre, lọc theo vùng hiện tại và loại trùng trước khi gửi BLE.
+    final roads = _mergeRoads(
+      center: center,
+      sources: [mapLibreRoads, bridge.currentMapSnapshot?.roads ?? const []],
+    );
+
+    MapDebug.log('MERGE', 'id=$requestId send=${roads.length} roads');
+    await bridge.sendMapData(
+      routeGeometry: route.geometry,
+      roads: roads,
+      routeProgressM: snap.routeProgressM,
+      includeRoute: false,
+    );
+
+    // Overpass là nguồn bổ sung chạy nền: không bao giờ chặn route/MapLibre.
+    // Khi thành công, kết quả sẽ được merge với tile/cache rồi gửi bản đầy đủ.
+    unawaited(_enrichRoadsFromOverpass(center));
+    return true;
+  }
+
+  /// Lần GPS đầu thường đến trước `onStyleLoaded` của MapLibre vài trăm ms.
+  /// Retry ngắn để lấy tile local ngay khi ready, tránh rơi sang Overpass và
+  /// để preview chỉ có route/không có roads trong suốt thời gian timeout mạng.
+  Future<List<RoadSegment>> _queryMapLibreRoads({
+    required GeoPoint center,
+    required int requestId,
+  }) async {
+    for (var attempt = 0; attempt < _mapLibreMaxAttempts; attempt++) {
+      if (attempt > 0) await Future<void>.delayed(_mapLibreRetryDelay);
+      if (!mounted || requestId != _mapDataRequestId) return const [];
+
+      final mapState = _mapKey.currentState;
+      if (mapState == null) continue;
+      final roads = await mapState.queryRoadsForMiniMap(center.lat, center.lng);
+      MapDebug.log(
+        'RETRY',
+        'id=$requestId attempt=${attempt + 1}/$_mapLibreMaxAttempts '
+            'roads=${roads.length}',
+      );
+      if (roads.isNotEmpty) return roads;
+    }
+    return const [];
+  }
+
+  Future<void> _enrichRoadsFromOverpass(GeoPoint queryCenter) async {
+    if (_overpassRoadsLoading) return;
+
+    final lastGoodCenter = _lastOverpassRoadsCenter;
+    if (lastGoodCenter != null &&
+        lastGoodCenter.distanceTo(queryCenter) < _overpassRefreshDistanceM) {
+      return;
     }
 
-    if (!mounted) return false;
-    debugPrint('[MapData] sendMapData: ${roads.length} roads total');
-    await ref.read(bleBridgeProvider).sendMapData(
-          routeGeometry: route.geometry,
-          roads: roads,
-          routeProgressM: snap.routeProgressM,
-        );
-    return true;
+    final now = DateTime.now();
+    final lastAttempt = _lastOverpassAttemptAt;
+    if (lastAttempt != null &&
+        now.difference(lastAttempt) < _overpassRetryCooldown) {
+      return;
+    }
+
+    _overpassRoadsLoading = true;
+    _lastOverpassAttemptAt = now;
+    try {
+      final overpassRoads = await ref
+          .read(overpassRoadServiceProvider)
+          .queryRoadsAround(
+            lat: queryCenter.lat,
+            lng: queryCenter.lng,
+            radiusM: 700,
+          );
+      MapDebug.log(
+        'OVERPASS',
+        'center=${queryCenter.lat.toStringAsFixed(5)},'
+            '${queryCenter.lng.toStringAsFixed(5)} roads=${overpassRoads.length}',
+      );
+      if (!mounted || overpassRoads.isEmpty) return;
+
+      final latest = ref.read(navControllerProvider);
+      final latestRoute = latest.route;
+      final latestCenter = latest.matchedPosition ?? latest.currentPosition;
+      if (latestRoute == null || !latest.isActive || latestCenter == null) {
+        return;
+      }
+
+      // Response vẫn hữu ích khi xe đã dịch chuyển nhẹ trong lúc chờ; bỏ nếu đã
+      // ra quá xa vùng query để tránh gắn road cũ vào anchor mới.
+      if (queryCenter.distanceTo(latestCenter) > _roadCacheRadiusM / 2) return;
+
+      final localRoads = await _mapKey.currentState?.queryRoadsForMiniMap(
+        latestCenter.lat,
+        latestCenter.lng,
+      );
+      if (!mounted) return;
+
+      final bridge = ref.read(bleBridgeProvider);
+      final merged = _mergeRoads(
+        center: latestCenter,
+        sources: [
+          overpassRoads,
+          localRoads ?? const [],
+          bridge.currentMapSnapshot?.roads ?? const [],
+        ],
+      );
+      _lastOverpassRoadsCenter = queryCenter;
+      MapDebug.log('OVERPASS', 'merged=${merged.length} roads');
+      await bridge.sendMapData(
+        routeGeometry: latestRoute.geometry,
+        roads: merged,
+        routeProgressM: latest.routeProgressM,
+        includeRoute: false,
+      );
+    } catch (e) {
+      MapDebug.log('OVERPASS', 'error=$e');
+    } finally {
+      _overpassRoadsLoading = false;
+    }
+  }
+
+  List<RoadSegment> _mergeRoads({
+    required GeoPoint center,
+    required List<List<RoadSegment>> sources,
+  }) {
+    final unique = <String, ({RoadSegment road, double distance})>{};
+    for (final source in sources) {
+      for (final road in source) {
+        if (road.points.length < 2) continue;
+        var minDistance = double.infinity;
+        for (final point in road.points) {
+          final distance = center.distanceTo(point);
+          if (distance < minDistance) minDistance = distance;
+        }
+        if (minDistance > _roadCacheRadiusM) continue;
+        final key = _roadKey(road);
+        final previous = unique[key];
+        if (previous == null ||
+            road.points.length > previous.road.points.length) {
+          unique[key] = (road: road, distance: minDistance);
+        }
+      }
+    }
+
+    final sorted = unique.values.toList()
+      ..sort((a, b) => a.distance.compareTo(b.distance));
+    return sorted
+        .take(_maxMergedRoads)
+        .map((entry) => entry.road)
+        .toList(growable: false);
+  }
+
+  String _roadKey(RoadSegment road) {
+    String pointKey(GeoPoint point) =>
+        '${point.lat.toStringAsFixed(5)},${point.lng.toStringAsFixed(5)}';
+    final first = pointKey(road.points.first);
+    final last = pointKey(road.points.last);
+    final ends = first.compareTo(last) <= 0 ? '$first|$last' : '$last|$first';
+    return '${road.type.value}|$ends';
   }
 
   void _endNavigation() {

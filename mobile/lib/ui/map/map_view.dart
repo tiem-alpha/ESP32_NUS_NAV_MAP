@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../../core/constants.dart';
+import '../../core/map_debug.dart';
 import '../../core/theme/app_theme.dart';
 import '../../models/app_settings.dart';
 import '../../models/geo_point.dart';
@@ -348,7 +349,14 @@ class MapViewState extends ConsumerState<MapView>
     double userLng,
   ) async {
     final c = _controller;
-    if (c == null || !_styleReady) return const [];
+    if (c == null || !_styleReady) {
+      MapDebug.log(
+        'SOURCE',
+        'not-ready controller=${c != null} style=$_styleReady '
+            'center=${userLat.toStringAsFixed(5)},${userLng.toStringAsFixed(5)}',
+      );
+      return const [];
+    }
 
     // Bounding box ~450 m around user (covers mini-map diagonal at 3 m/px × 300 px).
     const radiusM = 450.0;
@@ -359,17 +367,28 @@ class MapViewState extends ConsumerState<MapView>
     final bS = userLat - radiusM * latPerM;
     final bE = userLng + radiusM * lngPerM;
     final bW = userLng - radiusM * lngPerM;
+    final queryCenter = GeoPoint(userLat, userLng);
 
-    bool anyInBounds(List<GeoPoint> pts) =>
-        pts.any((p) => p.lat >= bS && p.lat <= bN && p.lng >= bW && p.lng <= bE);
+    bool intersectsBounds(List<GeoPoint> pts) {
+      var minLat = double.infinity;
+      var maxLat = double.negativeInfinity;
+      var minLng = double.infinity;
+      var maxLng = double.negativeInfinity;
+      for (final point in pts) {
+        if (point.lat < minLat) minLat = point.lat;
+        if (point.lat > maxLat) maxLat = point.lat;
+        if (point.lng < minLng) minLng = point.lng;
+        if (point.lng > maxLng) maxLng = point.lng;
+      }
+      return maxLat >= bS && minLat <= bN && maxLng >= bW && minLng <= bE;
+    }
 
     // Classes to skip (non-vehicle ways). 'service' được giữ lại vì ở VN
     // hẻm/ngõ nhỏ thường được gán highway=service trong OSM.
-    const skipClasses = {
-      'track', 'path', 'footway', 'cycleway', 'steps',
-    };
+    const skipClasses = {'track', 'path', 'footway', 'cycleway', 'steps'};
 
     List<dynamic> raw = const [];
+    var sourceName = 'none';
 
     // querySourceFeatures reads vector tile data directly → no camera-angle bias.
     for (final srcId in const [
@@ -382,9 +401,12 @@ class MapViewState extends ConsumerState<MapView>
         final r = await c.querySourceFeatures(srcId, 'transportation', null);
         if (r.isNotEmpty) {
           raw = r;
+          sourceName = '$srcId/transportation';
           break;
         }
-      } catch (_) {}
+      } catch (e) {
+        MapDebug.log('SOURCE', 'querySourceFeatures $srcId failed: $e');
+      }
     }
 
     // Fallback: rendered features (misses roads outside camera FOV but better than nothing).
@@ -397,23 +419,41 @@ class MapViewState extends ConsumerState<MapView>
             [],
             null,
           );
-        } catch (_) {}
+          sourceName = 'rendered-features';
+        } catch (e) {
+          MapDebug.log('SOURCE', 'queryRenderedFeatures failed: $e');
+        }
       }
     }
 
     final seen = <String>{};
-    final roads = <RoadSegment>[];
+    final roads = <({RoadSegment road, double distance})>[];
+    var skippedGeometry = 0;
+    var skippedClass = 0;
+    var skippedBounds = 0;
+    var skippedDuplicate = 0;
 
     for (final feat in raw) {
-      if (roads.length >= 80) break;
+      // Guard chống style/source bất thường trả quá nhiều feature, nhưng không
+      // cắt sớm ở 80 theo thứ tự tile vì thứ tự đó không liên quan tới user.
+      if (roads.length >= 1200) break;
       final geom = feat['geometry'];
-      if (geom == null) continue;
+      if (geom == null) {
+        skippedGeometry++;
+        continue;
+      }
       final type = geom['type'] as String?;
-      if (type != 'LineString' && type != 'MultiLineString') continue;
+      if (type != 'LineString' && type != 'MultiLineString') {
+        skippedGeometry++;
+        continue;
+      }
 
       final props = feat['properties'] as Map?;
       final cls = props?['class'] as String?;
-      if (cls != null && skipClasses.contains(cls)) continue;
+      if (cls != null && skipClasses.contains(cls)) {
+        skippedClass++;
+        continue;
+      }
 
       final hwType = HighwayType.fromOsmTag(cls ?? 'residential');
 
@@ -422,30 +462,70 @@ class MapViewState extends ConsumerState<MapView>
         final pts = <GeoPoint>[];
         for (final coord in coords) {
           if (coord is! List || coord.length < 2) continue;
-          pts.add(GeoPoint(
-            (coord[1] as num).toDouble(),
-            (coord[0] as num).toDouble(),
-          ));
+          pts.add(
+            GeoPoint(
+              (coord[1] as num).toDouble(),
+              (coord[0] as num).toDouble(),
+            ),
+          );
         }
-        if (pts.length < 2) return;
-        if (!anyInBounds(pts)) return;
-        final key =
-            '${pts.first.lat.toStringAsFixed(5)},${pts.first.lng.toStringAsFixed(5)},'
-            '${pts.last.lat.toStringAsFixed(5)},${pts.last.lng.toStringAsFixed(5)}';
-        if (seen.add(key)) roads.add(RoadSegment(type: hwType, points: pts));
+        if (pts.length < 2) {
+          skippedGeometry++;
+          return;
+        }
+        if (!intersectsBounds(pts)) {
+          skippedBounds++;
+          return;
+        }
+        String pointKey(GeoPoint point) =>
+            '${point.lat.toStringAsFixed(5)},${point.lng.toStringAsFixed(5)}';
+        final first = pointKey(pts.first);
+        final last = pointKey(pts.last);
+        final key = first.compareTo(last) <= 0
+            ? '$first|$last'
+            : '$last|$first';
+        if (!seen.add(key)) {
+          skippedDuplicate++;
+          return;
+        }
+        var minDistance = double.infinity;
+        for (final point in pts) {
+          final distance = queryCenter.distanceTo(point);
+          if (distance < minDistance) minDistance = distance;
+        }
+        roads.add((
+          road: RoadSegment(type: hwType, points: pts),
+          distance: minDistance,
+        ));
       }
 
       if (type == 'LineString') {
         addLine(geom['coordinates'] as List<dynamic>? ?? const []);
       } else {
-        for (final line in (geom['coordinates'] as List<dynamic>? ?? const [])) {
-          if (roads.length >= 30) break;
+        for (final line
+            in (geom['coordinates'] as List<dynamic>? ?? const [])) {
+          if (roads.length >= 1200) break;
           addLine(line as List<dynamic>);
         }
       }
     }
 
-    return roads;
+    // Chọn road gần user, không chọn 80 feature đầu tiên của tile. 400 đủ cho
+    // preview/cache; BleBridge tiếp tục chọn subset phù hợp giới hạn firmware.
+    roads.sort((a, b) => a.distance.compareTo(b.distance));
+    final result = roads
+        .take(400)
+        .map((entry) => entry.road)
+        .toList(growable: false);
+    MapDebug.log(
+      'SOURCE',
+      'source=$sourceName raw=${raw.length} parsed=${roads.length} '
+          'returned=${result.length} skipGeom=$skippedGeometry '
+          'skipClass=$skippedClass skipBounds=$skippedBounds '
+          'skipDup=$skippedDuplicate center=${userLat.toStringAsFixed(5)},'
+          '${userLng.toStringAsFixed(5)}',
+    );
+    return result;
   }
 
   Future<void> _onStyleLoaded() async {
