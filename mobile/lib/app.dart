@@ -35,7 +35,7 @@ class NavHudApp extends ConsumerWidget {
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
       themeMode: _themeMode(settings.themeMode),
-      home: const LocationPermissionGate(child: screenHomeScreen()),
+      home: const LocationPermissionGate(child: MapHomeScreen()),
     );
   }
 

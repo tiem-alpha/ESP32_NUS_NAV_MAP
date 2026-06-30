@@ -14,7 +14,7 @@ import '../widgets/maneuver_icon.dart';
 /// alternatives, checkbox tránh phí/cao tốc, nút BẮT ĐẦU 56dp, và (khi kéo lên)
 /// danh sách maneuver. Xử lý AsyncLoading / AsyncError.
 ///
-/// Đặt trong một DraggableScrollableSheet ở screenHomeScreen; nội dung nhận
+/// Đặt trong một DraggableScrollableSheet ở MapHomeScreen; nội dung nhận
 /// [scrollController] để cuộn được khi snap 90%.
 class RoutePreviewSheet extends ConsumerWidget {
   final ScrollController? scrollController;

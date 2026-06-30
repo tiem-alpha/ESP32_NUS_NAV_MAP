@@ -111,6 +111,16 @@ class LocationService implements ILocationService {
         forceLocationManager: false,
       );
     }
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+      return AppleSettings(
+        accuracy: accuracy,
+        activityType: ActivityType.automotiveNavigation,
+        distanceFilter: 0,
+        pauseLocationUpdatesAutomatically: false,
+        showBackgroundLocationIndicator: true,
+        allowBackgroundLocationUpdates: true,
+      );
+    }
     return const LocationSettings(accuracy: accuracy, distanceFilter: 0);
   }
 

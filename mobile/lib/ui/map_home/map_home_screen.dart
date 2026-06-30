@@ -22,14 +22,14 @@ import '../widgets/profile_selector.dart';
 /// ProfileSelector sticky. Long-press → reverse geocode → mini sheet → S3.
 /// routePreviewProvider có data → RoutePreviewSheet. navController active →
 /// push NavigationScreen.
-class screenHomeScreen extends ConsumerStatefulWidget {
-  const screenHomeScreen({super.key});
+class MapHomeScreen extends ConsumerStatefulWidget {
+  const MapHomeScreen({super.key});
 
   @override
-  ConsumerState<screenHomeScreen> createState() => _screenHomeScreenState();
+  ConsumerState<MapHomeScreen> createState() => _MapHomeScreenState();
 }
 
-class _screenHomeScreenState extends ConsumerState<screenHomeScreen> {
+class _MapHomeScreenState extends ConsumerState<MapHomeScreen> {
   final GlobalKey<MapViewState> _mapKey = GlobalKey<MapViewState>();
   GeoPoint? _userLocation;
   double _cameraBearing = 0;
